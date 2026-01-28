@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Moderator Dashboard - AI Safety Chat</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="moderator.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="dashboard-header">
+            <div class="header-left">
+                <h1><i class="fas fa-user-shield"></i> Moderator Dashboard</h1>
+                <p class="subtitle">AI Safety Chat - Human-in-the-Loop Oversight</p>
+            </div>
+            <div class="header-right">
+                <a href="index.html" class="btn-back">
+                    <i class="fas fa-arrow-left"></i>
+                    <span>Back to Chat</span>
+                </a>
+            </div>
+        </header>
+
+        <!-- Stats Panel -->
+        <div class="stats-panel">
+            <div class="stat-card">
+                <div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
+                    <i class="fas fa-flag"></i>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-value" id="totalFlagged">0</div>
+                    <div class="stat-label">Total Flagged Today</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon" style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);">
+                    <i class="fas fa-clock"></i>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-value" id="pendingReviews">0</div>
+                    <div class="stat-label">Pending Reviews</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon" style="background: linear-gradient(135deg, #14b8a6 0%, #0d9488 100%);">
+                    <i class="fas fa-stopwatch"></i>
+                </div>
+                <div class="stat-content">
+                    <div class="stat-value" id="avgReviewTime">0m</div>
+                    <div class="stat-label">Avg Review Time</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="dashboard-content">
+            <!-- Pending Reviews Section -->
+            <section class="review-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-exclamation-circle"></i> Pending Reviews</h2>
+                    <button id="simulateFlagBtn" class="btn-simulate">
+                        <i class="fas fa-plus"></i>
+                        Simulate New Flag
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table class="review-table" id="pendingTable">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>User Message</th>
+                                <th>Category</th>
+                                <th>AI Suggested Response</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pendingTableBody">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                    <div id="noPending" class="empty-state">
+                        <i class="fas fa-check-circle"></i>
+                        <p>No pending reviews. All clear!</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Reviewed Section -->
+            <section class="review-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-check-double"></i> Reviewed Items</h2>
+                </div>
+                <div class="table-container">
+                    <table class="review-table" id="reviewedTable">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>User Message</th>
+                                <th>Category</th>
+                                <th>Final Response</th>
+                                <th>Decision</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reviewedTableBody">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                    <div id="noReviewed" class="empty-state">
+                        <i class="fas fa-inbox"></i>
+                        <p>No reviewed items yet.</p>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="editModal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-edit"></i> Edit & Approve Response</h3>
+                <button class="modal-close" id="closeEditModalBtn">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section">
+                    <label><strong>Original AI Response:</strong></label>
+                    <div class="original-response-preview" id="originalResponsePreview"></div>
+                </div>
+                <div class="modal-section">
+                    <label for="editTextarea"><strong>Modified Response:</strong></label>
+                    <textarea id="editTextarea" rows="8" placeholder="Enter the modified response..." maxlength="2000"></textarea>
+                    <div class="char-counter">
+                        <span id="editCharCount">0</span> / 2000 characters
+                    </div>
+                </div>
+                <div class="modal-section">
+                    <label for="editNotes">Notes (optional):</label>
+                    <textarea id="editNotes" rows="2" placeholder="Add any notes about this edit..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" id="cancelEditBtn">Cancel</button>
+                <button class="btn-save" id="saveEditBtn">
+                    <i class="fas fa-check"></i> Save & Approve
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Reject Modal -->
+    <div id="rejectModal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-times-circle"></i> Reject & Provide Alternative</h3>
+                <button class="modal-close" id="closeRejectModalBtn">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-section">
+                    <label><strong>Original AI Response:</strong></label>
+                    <div class="original-response-preview" id="rejectOriginalPreview"></div>
+                </div>
+                <div class="modal-section">
+                    <label for="rejectionReason">Rejection Reason:</label>
+                    <select id="rejectionReason" class="setting-input">
+                        <option value="">Select reason...</option>
+                        <option value="inaccurate">Inaccurate Information</option>
+                        <option value="inappropriate">Inappropriate Response</option>
+                        <option value="incomplete">Incomplete Answer</option>
+                        <option value="safety_concern">Safety Concern</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                <div class="modal-section">
+                    <label for="rejectTextarea"><strong>Alternative Response:</strong></label>
+                    <textarea id="rejectTextarea" rows="8" placeholder="Enter the alternative response..." maxlength="2000"></textarea>
+                    <div class="char-counter">
+                        <span id="rejectCharCount">0</span> / 2000 characters
+                    </div>
+                </div>
+                <div class="modal-section">
+                    <label for="rejectNotes">Notes (optional):</label>
+                    <textarea id="rejectNotes" rows="2" placeholder="Add any notes about this rejection..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" id="cancelRejectBtn">Cancel</button>
+                <button class="btn-reject" id="saveRejectBtn">
+                    <i class="fas fa-check"></i> Reject & Send Alternative
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="moderator.js"></script>
+</body>
+</html>

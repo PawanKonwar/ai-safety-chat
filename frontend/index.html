@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Safety Chat - Educational System</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1><i class="fas fa-shield-alt"></i> AI Safety Chat</h1>
+                <p class="subtitle">Educational System with Safety Guardrails</p>
+            </div>
+            <div class="header-controls">
+                <button id="settingsBtn" class="btn-settings" title="Settings">
+                    <i class="fas fa-cog"></i>
+                </button>
+                <button id="learningModeBtn" class="btn-toggle">
+                    <i class="fas fa-graduation-cap"></i>
+                    <span>🎓 Learning Mode: OFF</span>
+                </button>
+                <button id="clearChatBtn" class="btn-clear">
+                    <i class="fas fa-trash-alt"></i>
+                    <span>Clear Chat</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Warning Bar (hidden by default) -->
+        <div id="warningBar" class="warning-bar hidden">
+            <i class="fas fa-exclamation-triangle"></i>
+            <span>Warning: This is a demonstration. Real AI safety systems require comprehensive oversight.</span>
+        </div>
+
+        <!-- Chat Area -->
+        <div class="chat-container">
+            <div id="chatMessages" class="chat-messages">
+                <div class="message ai-message">
+                    <div class="message-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        <div class="message-header">
+                            <span class="message-sender">AI Assistant</span>
+                            <span class="message-time">Just now</span>
+                        </div>
+                        <div class="message-text">
+                            Welcome! I'm an educational AI safety chatbot. I'm designed to help you learn about AI safety principles while maintaining appropriate guardrails. How can I assist you today?
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Hint Section -->
+        <div class="hint-section">
+            <p class="hint-label"><i class="fas fa-lightbulb"></i> Try asking:</p>
+            <div class="hint-examples">
+                <span class="hint-example">"What is AI safety?"</span>
+                <span class="hint-example">"How do guardrails work?"</span>
+                <span class="hint-example">"Explain bias in AI"</span>
+            </div>
+        </div>
+
+        <!-- Input Warning Bar (hidden by default) -->
+        <div id="inputWarningBar" class="input-warning-bar hidden">
+            <i class="fas fa-exclamation-triangle"></i>
+            <span id="inputWarningText"></span>
+        </div>
+
+        <!-- PII Warning Bar (hidden by default) -->
+        <div id="piiWarningBar" class="pii-warning-bar hidden">
+            <i class="fas fa-shield-alt"></i>
+            <span id="piiWarningText"></span>
+        </div>
+
+        <!-- Input Area -->
+        <div class="input-container">
+            <div class="input-wrapper">
+                <input 
+                    type="text" 
+                    id="messageInput" 
+                    class="message-input" 
+                    placeholder="Type your message here..."
+                    autocomplete="off"
+                >
+                <button id="sendBtn" class="btn-send">
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settingsModal" class="settings-modal hidden">
+            <div class="settings-modal-content">
+                <div class="settings-header">
+                    <h2><i class="fas fa-cog"></i> User Control Panel</h2>
+                    <button id="closeSettingsBtn" class="btn-close-settings">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <div class="settings-body">
+                    <!-- Safety Level -->
+                    <div class="setting-group">
+                        <label for="safetyLevel" class="setting-label">
+                            <i class="fas fa-shield-alt"></i> Safety Level
+                            <span class="setting-tooltip" title="Controls how strictly content is flagged for review">
+                                <i class="fas fa-question-circle"></i>
+                            </span>
+                        </label>
+                        <select id="safetyLevel" class="setting-input">
+                            <option value="strict">Strict - Flags more content, higher safety</option>
+                            <option value="moderate" selected>Moderate - Balanced (default)</option>
+                            <option value="lenient">Lenient - Fewer flags, faster responses</option>
+                        </select>
+                        <p class="setting-description">Strict mode flags more content for human review, while lenient mode allows more through automatically.</p>
+                    </div>
+                    
+                    <!-- Transparency -->
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <i class="fas fa-eye"></i> Transparency
+                            <span class="setting-tooltip" title="Show explanations when guardrails are triggered">
+                                <i class="fas fa-question-circle"></i>
+                            </span>
+                        </label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="transparencyToggle" checked>
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Show guardrail explanations</span>
+                        </label>
+                        <p class="setting-description">When enabled, you'll see explanations when safety guardrails are triggered.</p>
+                    </div>
+                    
+                    <!-- Learning Mode -->
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <i class="fas fa-graduation-cap"></i> Learning Mode
+                            <span class="setting-tooltip" title="Show detailed educational analysis of AI responses">
+                                <i class="fas fa-question-circle"></i>
+                            </span>
+                        </label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="learningModeToggle">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Enable learning mode</span>
+                        </label>
+                        <p class="setting-description">Shows detailed analysis of confidence scores, guardrails, and safety tips.</p>
+                    </div>
+                    
+                    <!-- Data Logging -->
+                    <div class="setting-group">
+                        <label class="setting-label">
+                            <i class="fas fa-database"></i> Data Preferences
+                            <span class="setting-tooltip" title="Allow conversation to be stored in database">
+                                <i class="fas fa-question-circle"></i>
+                            </span>
+                        </label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="dataLoggingToggle">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Allow conversation logging</span>
+                        </label>
+                        <p class="setting-description">When disabled, conversations are not stored in the database. Opt-in by default.</p>
+                    </div>
+                    
+                    <!-- Response Speed -->
+                    <div class="setting-group">
+                        <label for="responseSpeed" class="setting-label">
+                            <i class="fas fa-tachometer-alt"></i> Response Speed
+                            <span class="setting-tooltip" title="Balance between safety checks and response speed">
+                                <i class="fas fa-question-circle"></i>
+                            </span>
+                        </label>
+                        <select id="responseSpeed" class="setting-input">
+                            <option value="safety">Safety First - Slower, more thorough checks</option>
+                            <option value="balanced" selected>Balanced - Default</option>
+                            <option value="speed">Fast Responses - Prioritize speed</option>
+                        </select>
+                        <p class="setting-description">Safety First mode performs more thorough safety checks (may add slight delay). Fast mode prioritizes response speed.</p>
+                    </div>
+                </div>
+                
+                <div class="settings-footer">
+                    <button id="saveSettingsBtn" class="btn-save-settings">
+                        <i class="fas fa-save"></i> Save Settings
+                    </button>
+                    <button id="resetSettingsBtn" class="btn-reset-settings">
+                        <i class="fas fa-undo"></i> Reset to Defaults
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>
+                <i class="fas fa-info-circle"></i>
+                A conversational AI with safety guardrails and human-in-the-loop oversight.
+            </p>
+            <a href="moderator.html" class="footer-link">
+                <i class="fas fa-user-shield"></i>
+                Moderator Dashboard (Demo)
+            </a>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
