@@ -58,17 +58,17 @@ def decode_access_token(token: str) -> Optional[dict]:
 def get_current_user(
     session_token: Optional[str] = Cookie(None),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ) -> User:
     """Get current user from token or create anonymous user"""
-    
+
     # Try to get token from Authorization header
     token = None
     if credentials:
         token = credentials.credentials
     elif session_token:
         token = session_token
-    
+
     if token:
         payload = decode_access_token(token)
         if payload:
@@ -77,20 +77,16 @@ def get_current_user(
                 user = db.query(User).filter(User.id == int(user_id)).first()
                 if user:
                     return user
-    
+
     # If no valid token, return anonymous user
     anonymous_user = db.query(User).filter(User.username == "anonymous").first()
     if not anonymous_user:
         # Create anonymous user if it doesn't exist
-        anonymous_user = User(
-            username="anonymous",
-            email=None,
-            role="user"
-        )
+        anonymous_user = User(username="anonymous", email=None, role="user")
         db.add(anonymous_user)
         db.commit()
         db.refresh(anonymous_user)
-    
+
     return anonymous_user
 
 
