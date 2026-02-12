@@ -9,9 +9,8 @@ and human-in-the-loop oversight mechanisms.
 from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -68,7 +67,6 @@ async def add_cors_headers(request: Request, call_next):
     """Add CORS headers to all responses, including handling 'null' origin"""
     response = await call_next(request)
     # Explicitly set CORS headers for all responses
-    origin = request.headers.get("origin")
     response.headers["Access-Control-Allow-Origin"] = "*"  # Allow all origins including 'null'
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept, Origin, X-Requested-With, Access-Control-Request-Method, Access-Control-Request-Headers"
@@ -307,18 +305,6 @@ class ChatResponse(BaseModel):
     learning_analysis: Optional[LearningAnalysis] = None  # Educational analysis for learning mode
     guardrail_explanation: Optional[str] = None  # Explanation when transparency is enabled
 
-class FlaggedMessage(BaseModel):
-    id: int
-    timestamp: str
-    user_message: str
-    category: str
-    ai_response: str
-    confidence: float  # Safety filter confidence
-    confidence_score: Optional[float] = None  # AI response confidence
-    confidence_level: Optional[str] = None
-    user_id: Optional[int] = None
-    username: Optional[str] = None
-
 class RegisterRequest(BaseModel):
     username: str
     email: Optional[str] = None
@@ -335,17 +321,21 @@ class UserResponse(BaseModel):
     role: str
 
 class FlaggedMessage(BaseModel):
+    """Moderator queue flagged message with full safety metadata."""
     id: int
     timestamp: str
     user_message: str
     ai_response: str
-    category: Optional[str]
-    confidence: Optional[float]
-    confidence_score: Optional[float]
-    confidence_level: Optional[str]
+    category: Optional[str] = None
+    confidence: Optional[float] = None
+    confidence_score: Optional[float] = None
+    confidence_level: Optional[str] = None
+    user_id: Optional[int] = None
+    username: Optional[str] = None
     priority_level: Optional[str] = None
     escalation_reason: Optional[str] = None
     target_response_time: Optional[int] = None
+
 
 class ModeratorActionRequest(BaseModel):
     action: str  # approve, reject, edit, clarify, escalate
@@ -868,7 +858,6 @@ def analyze_conversation_context(conversation_history: List[Dict], new_message: 
                     # If previous was sensitive but new message avoids category keywords but has related terms
                     if any(kw in lower_new for kw in keywords):
                         # Check if it would have been flagged with original keywords
-                        test_message = new_message
                         for keyword in SAFETY_KEYWORDS.get(cat, []):
                             if keyword.lower() in lower_new:
                                 break
@@ -1107,6 +1096,7 @@ Remember: Answer the question first, then add safety context only when needed. D
             return response.choices[0].message.content.strip()
         except Exception as e:
             # Fallback to mock response on OpenAI API error
+            print(f"⚠️ OpenAI API error: {e}")
             return openai_client.generate_response(user_message, category, pii_types)
     else:
         return openai_client.generate_response(user_message, category, pii_types)
@@ -1583,6 +1573,7 @@ async def chat(
                     }
             except Exception as e:
                 # Fallback: manually extract context analysis data
+                print(f"⚠️ Error converting context_analysis to dict: {e}")
                 context_dict = {
                     "risk_escalation": getattr(context_analysis, 'risk_escalation', False),
                     "filter_bypass_attempt": getattr(context_analysis, 'filter_bypass_attempt', False),
@@ -1626,7 +1617,7 @@ async def get_moderator_queue(
     # Get all flagged user messages that haven't been reviewed
     # We look for user messages that are flagged, and check if they have moderator decisions
     flagged_user_messages = db.query(Message).filter(
-        Message.flagged == True,
+        Message.flagged,
         Message.role == "user"
     ).all()
     
@@ -1648,8 +1639,8 @@ async def get_moderator_queue(
         ).order_by(Message.timestamp).first()
         
         conversation = db.query(Conversation).filter(Conversation.id == user_msg.conversation_id).first()
-        user = db.query(User).filter(User.id == conversation.user_id).first() if conversation else None
-        
+        conversation_user = db.query(User).filter(User.id == conversation.user_id).first() if conversation else None
+
         # Get confidence score from AI message
         confidence_score = ai_msg.confidence_score if ai_msg else None
         confidence_level = None
@@ -1675,6 +1666,8 @@ async def get_moderator_queue(
             "confidence": user_msg.confidence,
             "confidence_score": confidence_score,
             "confidence_level": confidence_level,
+            "user_id": conversation_user.id if conversation_user else None,
+            "username": conversation_user.username if conversation_user else None,
             "priority_level": priority_level,
             "escalation_reason": escalation_reason,
             "target_response_time": target_response_time
@@ -1891,7 +1884,7 @@ async def confidence_examples():
 @app.get("/health")
 async def health_check(db: Session = Depends(get_db)):
     """Health check endpoint"""
-    flagged_count = db.query(Message).filter(Message.flagged == True).count()
+    flagged_count = db.query(Message).filter(Message.flagged).count()
     total_messages = db.query(Message).count()
     low_confidence_count = db.query(Message).filter(
         Message.confidence_score < 50.0,
