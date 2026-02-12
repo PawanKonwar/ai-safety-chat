@@ -13,8 +13,9 @@ from app import app, check_safety_filter, SAFETY_KEYWORDS
 
 @pytest.fixture
 def client():
-    """Create a test client for the FastAPI app."""
-    return TestClient(app)
+    """Create a test client for the FastAPI app using fastapi.testclient."""
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 # --- Health Check Tests ---
