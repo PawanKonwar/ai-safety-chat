@@ -1,10 +1,12 @@
 # AI Safety Chat - Educational System with Safety Guardrails
 
+[![CI](https://github.com/PawanKonwar/ai-safety-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/PawanKonwar/ai-safety-chat/actions/workflows/ci.yml)
+
 <div align="center">
 
 **A comprehensive conversational AI system demonstrating safety guardrails, human-in-the-loop oversight, and responsible AI practices.**
 
-[![CI](https://github.com/PawanKonwar/ai-safety-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/PawanKonwar/ai-safety-chat/actions/workflows/ci.yml)
+
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com/)
