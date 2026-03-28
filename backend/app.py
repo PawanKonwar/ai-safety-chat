@@ -674,7 +674,9 @@ def calculate_priority(
     return ("low", "General content review", 60)
 
 
-def _fetch_historical_risk_context(db: Session, user_id: int) -> list[tuple[object, str]]:
+def _fetch_historical_risk_context(
+    db: Session, user_id: int
+) -> list[tuple[object, str]]:
     """
     Collect chronological snippets from prior risk-relevant interactions for this user:
     user messages that were flagged or categorized non-safe, and user messages that
@@ -752,7 +754,9 @@ def _fetch_historical_risk_context(db: Session, user_id: int) -> list[tuple[obje
     return items
 
 
-def _heuristic_escalating_risk(past_excerpts: list[str], current_message: str) -> tuple[bool, str]:
+def _heuristic_escalating_risk(
+    past_excerpts: list[str], current_message: str
+) -> tuple[bool, str]:
     """Fast path when LLM/embeddings unavailable: coarse escalation signal."""
     if len(past_excerpts) < 2:
         return False, ""
@@ -1008,9 +1012,7 @@ def _collect_contextual_pii_spans(text: str) -> List[tuple[int, int, str, str]]:
         r"\b\+\d{1,3}\s*\d{3}\s*\d{3}\s*\d{4}\b",
         r"\b\d{3}\s+\d{3}\s+\d{4}\b",
     ]
-    phone_ctx = (
-        r"\b(?:phone|call|text|contact|number|tel|mobile)\s*[:\-]?\s*\d{10}\b"
-    )
+    phone_ctx = r"\b(?:phone|call|text|contact|number|tel|mobile)\s*[:\-]?\s*\d{10}\b"
     for m in re.finditer(phone_ctx, text, re.IGNORECASE):
         spans.append((m.start(), m.end(), "PHONE", m.group()))
     for pattern in phone_patterns:
@@ -2309,9 +2311,7 @@ async def chat(
     historical_risk_escalation = False
     historical_risk_note: Optional[str] = None
     try:
-        hr = await check_historical_risk_patterns(
-            db, current_user.id, db_user_message
-        )
+        hr = await check_historical_risk_patterns(db, current_user.id, db_user_message)
         if hr.get("escalating"):
             historical_risk_escalation = True
             historical_risk_note = hr.get("note")
@@ -2329,8 +2329,8 @@ async def chat(
         stream_safety_stopped: bool = False,
     ) -> ChatResponse:
         # Calculate confidence score for AI response
-        confidence_score, confidence_level, confidence_reasons = calculate_confidence_score(
-            llm_user_message, ai_response, category
+        confidence_score, confidence_level, confidence_reasons = (
+            calculate_confidence_score(llm_user_message, ai_response, category)
         )
 
         # Auto-flag based on confidence (adjusted by safety level setting)
@@ -2374,11 +2374,13 @@ async def chat(
         target_response_time = 60  # Default
 
         if final_flagged:
-            priority_level, escalation_reason, target_response_time = calculate_priority(
-                category=category,
-                confidence=confidence,
-                content=llm_user_message,
-                confidence_score=confidence_score,
+            priority_level, escalation_reason, target_response_time = (
+                calculate_priority(
+                    category=category,
+                    confidence=confidence,
+                    content=llm_user_message,
+                    confidence_score=confidence_score,
+                )
             )
             if historical_risk_escalation:
                 priority_level = "critical"
@@ -2407,13 +2409,9 @@ async def chat(
         guardrail_explanation = None
         if settings.transparency and (final_flagged or category):
             if stream_safety_stopped:
-                guardrail_explanation = (
-                    "Guardrail triggered: Assistant response was stopped mid-stream by the output safety filter."
-                )
+                guardrail_explanation = "Guardrail triggered: Assistant response was stopped mid-stream by the output safety filter."
             elif category == "crisis":
-                guardrail_explanation = (
-                    "Guardrail triggered: Crisis content detected. This query was flagged for review to ensure appropriate handling."
-                )
+                guardrail_explanation = "Guardrail triggered: Crisis content detected. This query was flagged for review to ensure appropriate handling."
             elif historical_risk_escalation:
                 guardrail_explanation = (
                     "Guardrail triggered: Long-term risk memory suggests an escalating pattern compared to your prior "
@@ -2522,9 +2520,7 @@ async def chat(
                     flag_reasons.append("persistent sensitive queries")
 
             if flag_reasons:
-                message_for_moderator = (
-                    f"Flagged for: {', '.join(flag_reasons)}. Message: {db_user_message[:100]}"
-                )
+                message_for_moderator = f"Flagged for: {', '.join(flag_reasons)}. Message: {db_user_message[:100]}"
             else:
                 message_for_moderator = f"Flagged: {db_user_message[:100]}"
         else:
