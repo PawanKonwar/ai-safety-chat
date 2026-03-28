@@ -94,6 +94,9 @@ class Message(Base):
     flagged = Column(Boolean, default=False, index=True)
     pii_detected = Column(Boolean, default=False, index=True)  # PII detection flag
     pii_types = Column(JSON, nullable=True)  # List of detected PII types
+    pii_placeholder_mapping = Column(
+        JSON, nullable=True
+    )  # {{NAME_1}}: original; for authorized unmask only
     priority_level = Column(
         String, nullable=True, index=True
     )  # critical, high, medium, low
@@ -293,6 +296,13 @@ def migrate_database():
                 )
                 conn.commit()
                 print("✅ Added target_response_time column to messages table")
+
+            if "pii_placeholder_mapping" not in existing_msg_columns:
+                conn.execute(
+                    text("ALTER TABLE messages ADD COLUMN pii_placeholder_mapping TEXT")
+                )
+                conn.commit()
+                print("✅ Added pii_placeholder_mapping column to messages table")
 
             # Create index on priority_level for faster sorting
             try:

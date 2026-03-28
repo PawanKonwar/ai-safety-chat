@@ -6,10 +6,15 @@ Implements safety guardrails, PII detection, priority-based escalation,
 and human-in-the-loop oversight mechanisms.
 """
 
+import asyncio
+import logging
 from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+import json
+from typing import Optional, List, Dict, Any, AsyncIterator
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 import os
 from dotenv import load_dotenv
@@ -31,6 +36,24 @@ load_dotenv()
 
 # Initialize database on startup
 init_db()
+
+logger = logging.getLogger(__name__)
+
+# Phrases in the *assistant* stream that trigger kill-switch (last N words + full tail scan)
+STREAM_OUTPUT_SAFETY_PHRASES = [
+    "kill yourself",
+    "kill your self",
+    "you should die",
+    "end your life",
+    "commit suicide",
+    "how to make a bomb",
+    "how to build a bomb",
+    "ignore previous instructions",
+    "ignore all previous",
+    "disregard your instructions",
+    "system prompt",
+    "jailbreak",
+]
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -141,6 +164,23 @@ SAFETY_KEYWORDS = {
         "not worth living",
     ],
 }
+
+# LLM intent classification: system prompt (strict JSON output)
+INTENT_CLASSIFICATION_SYSTEM_PROMPT = """You are a safety classifier for a chat assistant. Analyze the user's message and classify its primary intent into exactly one category:
+
+- medical: health, symptoms, diagnosis, drugs, treatment, mental health discussion that is NOT self-harm crisis
+- financial: investing, taxes, money advice, crypto, loans, banking
+- legal: laws, lawsuits, contracts, lawyers, illegal acts as legal questions
+- crisis: self-harm, suicide, wanting to die, severe hopelessness requiring immediate support
+- safe: general chat, facts, education, or no sensitive intent
+
+Rules:
+- Choose crisis if there is any indication of self-harm or suicidal ideation.
+- If multiple apply, pick the highest-risk category (crisis > medical > legal > financial > safe).
+- Respond with ONLY a single JSON object, no markdown, no extra text.
+- Schema (all keys required):
+{"category": "<medical|financial|legal|crisis|safe>", "confidence_score": <float between 0 and 1>, "reason": "<one short sentence explaining the classification>"}
+"""
 
 # OpenAI API key (optional)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -300,6 +340,33 @@ class MockOpenAI:
             # Default: answer helpfully, then add safety context
             return f'I can help with "{user_message}". In an AI safety system, responses are evaluated for accuracy and appropriateness. This educational system demonstrates how guardrails help ensure responsible AI behavior.'
 
+    @staticmethod
+    def classify_intent(message: str) -> Dict[str, Any]:
+        """
+        Offline intent classification using the same keyword signals as check_safety_filter.
+        Returns the same JSON shape as the LLM path for pipeline compatibility.
+        """
+        category, confidence = check_safety_filter(message)
+        if category is None:
+            return {
+                "category": "safe",
+                "confidence_score": 1.0,
+                "reason": "No sensitive intent detected (mock classifier)",
+            }
+        reason_map = {
+            "medical": "User message aligns with medical or health-related content",
+            "financial": "User message aligns with financial or investment-related content",
+            "legal": "User message aligns with legal topics or advice",
+            "crisis": "User message indicates possible self-harm or crisis",
+        }
+        return {
+            "category": category,
+            "confidence_score": float(confidence),
+            "reason": reason_map.get(
+                category, "Sensitive category detected (mock classifier)"
+            ),
+        }
+
 
 # Real OpenAI client (if API key is provided)
 if USE_OPENAI:
@@ -335,6 +402,11 @@ else:
     openai_client = MockOpenAI()
 
 
+def uses_real_openai_api() -> bool:
+    """True when an API key is configured and the client is the official SDK, not MockOpenAI."""
+    return bool(USE_OPENAI) and not isinstance(openai_client, MockOpenAI)
+
+
 # Pydantic Models
 class UserSettings(BaseModel):
     """User control panel settings"""
@@ -351,6 +423,7 @@ class ChatRequest(BaseModel):
     learning_mode: bool = False
     session_id: Optional[str] = None
     settings: Optional[UserSettings] = None
+    stream: bool = False  # If True, NDJSON stream (application/x-ndjson)
 
 
 class ConversationMessage(BaseModel):
@@ -601,6 +674,196 @@ def calculate_priority(
     return ("low", "General content review", 60)
 
 
+def _fetch_historical_risk_context(db: Session, user_id: int) -> list[tuple[object, str]]:
+    """
+    Collect chronological snippets from prior risk-relevant interactions for this user:
+    user messages that were flagged or categorized non-safe, and user messages that
+    preceded medium-confidence assistant replies.
+    Returns list of (timestamp, labeled_excerpt) sorted oldest-first.
+    """
+    items: list[tuple[object, str]] = []
+    seen: set[str] = set()
+
+    user_rows = (
+        db.query(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .filter(Conversation.user_id == user_id)
+        .filter(Message.role == "user")
+        .filter(
+            or_(
+                Message.flagged.is_(True),
+                and_(Message.category.isnot(None), Message.category != "safe"),
+            )
+        )
+        .order_by(Message.timestamp.desc())
+        .limit(35)
+        .all()
+    )
+    for r in user_rows:
+        t = (r.content or "").strip()[:600]
+        if not t:
+            continue
+        key = t[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append((r.timestamp, f"[prior_flagged_or_sensitive]: {t}"))
+
+    assist_rows = (
+        db.query(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .filter(Conversation.user_id == user_id)
+        .filter(Message.role == "assistant")
+        .filter(
+            or_(
+                Message.confidence_level == "Medium",
+                and_(
+                    Message.confidence_score.isnot(None),
+                    Message.confidence_score >= 35.0,
+                    Message.confidence_score < 70.0,
+                ),
+            )
+        )
+        .order_by(Message.timestamp.desc())
+        .limit(25)
+        .all()
+    )
+    for ar in assist_rows:
+        um = (
+            db.query(Message)
+            .filter(Message.conversation_id == ar.conversation_id)
+            .filter(Message.role == "user")
+            .filter(Message.timestamp < ar.timestamp)
+            .order_by(Message.timestamp.desc())
+            .first()
+        )
+        if not um or not (um.content or "").strip():
+            continue
+        t = um.content.strip()[:600]
+        key = f"med::{um.conversation_id}::{t[:200]}"
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(
+            (um.timestamp, f"[prior_user_before_medium_confidence_reply]: {t}")
+        )
+
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def _heuristic_escalating_risk(past_excerpts: list[str], current_message: str) -> tuple[bool, str]:
+    """Fast path when LLM/embeddings unavailable: coarse escalation signal."""
+    if len(past_excerpts) < 2:
+        return False, ""
+    lower = current_message.lower()
+    severe = [
+        "kill",
+        "suicide",
+        "bomb",
+        "weapon",
+        "hurt myself",
+        "end my life",
+        "attack",
+        "how do i make",
+        "how to make",
+    ]
+    mild_prior = sum(1 for p in past_excerpts if len(p) < 120)
+    severe_now = any(s in lower for s in severe)
+    if severe_now and len(past_excerpts) >= 2:
+        return (
+            True,
+            "Heuristic: severe-risk wording with multiple prior risk interactions on record",
+        )
+    if mild_prior >= 2 and severe_now:
+        return (
+            True,
+            "Heuristic: escalation from shorter prior queries to higher-severity current content",
+        )
+    return False, ""
+
+
+def _llm_assess_escalating_risk_sync(
+    past_excerpts: list[str], current_message: str
+) -> tuple[bool, str]:
+    """Call OpenAI JSON mode to detect escalating risk patterns."""
+    if not past_excerpts:
+        return False, ""
+
+    past_block = "\n---\n".join(past_excerpts[-25:])
+    if len(past_block) > 8000:
+        past_block = past_block[-8000:]
+
+    system = (
+        "You are a safety analyst. Given prior user message excerpts from interactions "
+        "that were already flagged or tied to medium-confidence model replies, and the "
+        "user's CURRENT message, decide if the trajectory shows ESCALATING risk "
+        "(e.g. curiosity moving toward specific harmful intent, fixation, or progressive severity). "
+        "Do not flag mere repetition of benign topics. "
+        'Respond with JSON only: {"escalating": boolean, "note": string}. '
+        '"note" must be one short sentence for human moderators (empty if not escalating).'
+    )
+    user = f"PAST EXCERPTS (oldest to newest):\n{past_block}\n\nCURRENT MESSAGE:\n{current_message[:4000]}"
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0,
+            max_tokens=200,
+            response_format={"type": "json_object"},
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        data = json.loads(raw)
+        escalating = bool(data.get("escalating"))
+        note = (data.get("note") or "").strip()
+        if escalating and not note:
+            note = "LLM: escalating risk pattern vs prior flagged or medium-confidence history"
+        return escalating, note[:500]
+    except Exception as e:
+        logger.warning("LLM escalation assessment failed: %s", e)
+        return _heuristic_escalating_risk(past_excerpts, current_message)
+
+
+async def check_historical_risk_patterns(
+    db: Session,
+    user_id: int,
+    current_message: str,
+) -> Dict[str, Any]:
+    """
+    Search past messages for this user (flagged or medium-confidence-related) and assess
+    whether the current message continues an escalating risk trajectory.
+
+    Returns {"escalating": bool, "note": Optional[str]}.
+    """
+    if not current_message or not current_message.strip():
+        return {"escalating": False, "note": None}
+
+    items = _fetch_historical_risk_context(db, user_id)
+    if len(items) < 2:
+        return {"escalating": False, "note": None}
+
+    past_excerpts = [text for _, text in items]
+
+    if not uses_real_openai_api():
+        escalating, note = _heuristic_escalating_risk(past_excerpts, current_message)
+        return {
+            "escalating": escalating,
+            "note": note if escalating else None,
+        }
+
+    escalating, note = await asyncio.to_thread(
+        _llm_assess_escalating_risk_sync, past_excerpts, current_message
+    )
+    return {
+        "escalating": escalating,
+        "note": note if escalating else None,
+    }
+
+
 # Safety Filter Function
 def check_safety_filter(message: str):
     """
@@ -656,6 +919,175 @@ def check_safety_filter(message: str):
         return category, confidence
 
     return None, 0.0
+
+
+_ALLOWED_INTENT_CATEGORIES = frozenset(
+    {"medical", "financial", "legal", "crisis", "safe"}
+)
+
+
+def _normalize_intent_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and normalize LLM JSON into a consistent intent dict."""
+    raw_cat = str(data.get("category", "safe")).lower().strip()
+    if raw_cat not in _ALLOWED_INTENT_CATEGORIES:
+        raw_cat = "safe"
+    try:
+        conf = float(data.get("confidence_score", 0.9))
+    except (TypeError, ValueError):
+        conf = 0.9
+    conf = max(0.0, min(1.0, conf))
+    reason = str(data.get("reason", "")).strip() or "Classified by intent model"
+    return {"category": raw_cat, "confidence_score": conf, "reason": reason}
+
+
+async def classify_message_intent(message: str) -> Dict[str, Any]:
+    """
+    LLM-based intent classification (OpenAI) with MockOpenAI keyword fallback.
+    Returns strictly: {"category": "medical"|"financial"|"legal"|"crisis"|"safe",
+                       "confidence_score": float 0-1, "reason": str}
+    """
+    text = (message or "").strip()
+    if not text:
+        return {
+            "category": "safe",
+            "confidence_score": 1.0,
+            "reason": "Empty message",
+        }
+
+    if uses_real_openai_api():
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": INTENT_CLASSIFICATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=256,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            parsed = json.loads(raw)
+            return _normalize_intent_payload(parsed)
+        except Exception as e:
+            print(f"⚠️ Intent classification LLM failed, using mock: {e}")
+            return MockOpenAI.classify_intent(text)
+
+    return MockOpenAI.classify_intent(text)
+
+
+# --- Contextual PII masking (for LLM) vs full redaction (for DB) ---
+
+
+def _merge_non_overlapping_spans(
+    spans: List[tuple[int, int, str, str]],
+) -> List[tuple[int, int, str, str]]:
+    """Prefer longer spans when they overlap (greedy by length)."""
+    if not spans:
+        return []
+    spans_sorted = sorted(spans, key=lambda x: -(x[1] - x[0]))
+    taken: List[tuple[int, int]] = []
+    result: List[tuple[int, int, str, str]] = []
+    for start, end, kind, val in spans_sorted:
+        if any(not (end <= ts or start >= te) for ts, te in taken):
+            continue
+        result.append((start, end, kind, val))
+        taken.append((start, end))
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def _collect_contextual_pii_spans(text: str) -> List[tuple[int, int, str, str]]:
+    """Find spans for PHONE, LOCATION, NAME using regex/heuristics (no heavy ML deps)."""
+    spans: List[tuple[int, int, str, str]] = []
+
+    phone_patterns = [
+        r"\b\(\d{3}\)\s*\d{3}-\d{4}\b",
+        r"\b\d{3}-\d{3}-\d{4}\b",
+        r"\b\d{3}\.\d{3}\.\d{4}\b",
+        r"\b\+\d{1,3}\s*\d{3}\s*\d{3}\s*\d{4}\b",
+        r"\b\d{3}\s+\d{3}\s+\d{4}\b",
+    ]
+    phone_ctx = (
+        r"\b(?:phone|call|text|contact|number|tel|mobile)\s*[:\-]?\s*\d{10}\b"
+    )
+    for m in re.finditer(phone_ctx, text, re.IGNORECASE):
+        spans.append((m.start(), m.end(), "PHONE", m.group()))
+    for pattern in phone_patterns:
+        for m in re.finditer(pattern, text):
+            spans.append((m.start(), m.end(), "PHONE", m.group()))
+
+    location_patterns = [
+        (
+            r"\b\d+\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Drive|Dr|Lane|Ln|Boulevard|Blvd|Way|Circle|Cir)\b",
+            re.IGNORECASE,
+        ),
+        (
+            r"(?i)\b(?:in|from|near|at)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+            0,
+        ),
+    ]
+    for spec in location_patterns:
+        pat, flags = spec
+        for m in re.finditer(pat, text, flags):
+            spans.append((m.start(), m.end(), "LOCATION", m.group()))
+
+    name_patterns = [
+        r"(?i)\b(?:my name is|i am|i'm|call me|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b",
+        r"(?i)\b(?:mr\.|mrs\.|ms\.|dr\.)\s+([A-Z][a-z]+)\b",
+    ]
+    for pat in name_patterns:
+        for m in re.finditer(pat, text):
+            if m.lastindex:
+                spans.append(
+                    (m.start(1), m.end(1), "NAME", m.group(1)),
+                )
+            else:
+                spans.append((m.start(), m.end(), "NAME", m.group()))
+
+    return spans
+
+
+def mask_pii_contextually(text: str) -> tuple[str, Dict[str, str]]:
+    """
+    Replace Names, Locations, and Phone numbers with placeholders {{NAME_1}}, etc.
+    Returns (masked_text, mapping) where mapping[placeholder] = original substring.
+    Uses regex/heuristics only (lightweight; swap for Presidio if desired).
+    """
+    if not text or not text.strip():
+        return text, {}
+
+    spans = _collect_contextual_pii_spans(text)
+    merged = _merge_non_overlapping_spans(spans)
+    if not merged:
+        return text, {}
+
+    counters = {"NAME": 0, "LOCATION": 0, "PHONE": 0}
+    mapping: Dict[str, str] = {}
+    replacements: List[tuple[int, int, str]] = []
+
+    for start, end, kind, original in merged:
+        counters[kind] += 1
+        n = counters[kind]
+        placeholder = f"{{{{{kind}_{n}}}}}"
+        mapping[placeholder] = original
+        replacements.append((start, end, placeholder))
+
+    out = text
+    for start, end, ph in sorted(replacements, key=lambda x: -x[0]):
+        out = out[:start] + ph + out[end:]
+
+    return out, mapping
+
+
+def unmask_pii(text: str, mapping: Dict[str, str]) -> str:
+    """Restore placeholders using mapping (longest keys first to avoid partial matches)."""
+    if not mapping:
+        return text
+    out = text
+    for key in sorted(mapping.keys(), key=len, reverse=True):
+        out = out.replace(key, mapping[key])
+    return out
 
 
 # PII Detection and Redaction Function
@@ -1354,11 +1786,59 @@ async def generate_ai_response(
     user_message: str,
     category: Optional[str] = None,
     pii_types: Optional[List[str]] = None,
-) -> str:
+) -> tuple[str, bool]:
     """
-    Generate AI response with proper crisis handling
+    Build full assistant text by draining stream_ai_response_chunks (OpenAI stream=True
+    or mock chunks). Returns (text, stream_safety_stopped).
     """
-    # CRITICAL: Check for crisis content FIRST, before any API calls
+    accumulated = ""
+    async for ev in stream_ai_response_chunks(user_message, category, pii_types):
+        if ev["type"] == "delta":
+            accumulated += ev["text"]
+        elif ev["type"] == "safety_violation":
+            logger.warning(
+                "stream_safety_kill_switch (buffered) category=%s reason=%s snippet=%r",
+                ev.get("category"),
+                ev.get("reason"),
+                (accumulated[-200:] if accumulated else ""),
+            )
+            accumulated += "\n\n[Response stopped by safety filter.]"
+            return accumulated, True
+    return accumulated, False
+
+
+def stream_output_safety_lite(accumulated: str, buffer_words: int = 5) -> Optional[str]:
+    """
+    Lite kill-switch on streaming assistant text: rolling window + keyword list + check_safety_filter on window.
+    Returns category if violation (e.g. crisis), else None.
+    """
+    if not accumulated or len(accumulated.strip()) < 2:
+        return None
+    words = accumulated.split()
+    window = " ".join(words[-buffer_words:]).lower() if words else ""
+    lower_full = accumulated.lower()
+    for phrase in STREAM_OUTPUT_SAFETY_PHRASES:
+        if phrase in window or phrase in lower_full[-300:]:
+            return "crisis"
+    cat, _ = check_safety_filter(window)
+    if cat == "crisis":
+        return "crisis"
+    cat2, _ = check_safety_filter(lower_full[-200:])
+    if cat2 == "crisis":
+        return "crisis"
+    return None
+
+
+async def stream_ai_response_chunks(
+    user_message: str,
+    category: Optional[str],
+    pii_types: Optional[List[str]],
+) -> AsyncIterator[Dict[str, Any]]:
+    """
+    Stream assistant tokens as events. Yields dicts:
+    - {"type": "delta", "text": "..."}
+    - {"type": "safety_violation", "category": "...", "reason": "..."} then stops
+    """
     lower_message = user_message.lower()
     crisis_keywords = [
         "i want to die",
@@ -1377,51 +1857,27 @@ async def generate_ai_response(
         "cutting myself",
         "not worth living",
     ]
+    crisis_response = (
+        "I'm concerned about what you've shared. If you're in immediate danger, please call emergency services (911) or your local crisis hotline right away.\n\n"
+        "**Crisis Resources:**\n"
+        "• National Suicide Prevention Lifeline: 988 (24/7)\n"
+        "• Crisis Text Line: Text HOME to 741741\n"
+        "• International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/\n\n"
+        "This message has been flagged for immediate human review. A trained professional will reach out to provide support. You are not alone, and help is available."
+    )
 
-    # Check for crisis keywords in content
     for keyword in crisis_keywords:
         if keyword in lower_message:
-            # Crisis detected - return immediate resources
-            crisis_response = (
-                "I'm concerned about what you've shared. If you're in immediate danger, please call emergency services (911) or your local crisis hotline right away.\n\n"
-                "**Crisis Resources:**\n"
-                "• National Suicide Prevention Lifeline: 988 (24/7)\n"
-                "• Crisis Text Line: Text HOME to 741741\n"
-                "• International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/\n\n"
-                "This message has been flagged for immediate human review. A trained professional will reach out to provide support. You are not alone, and help is available."
-            )
-            return crisis_response
+            for i in range(0, len(crisis_response), 24):
+                yield {"type": "delta", "text": crisis_response[i : i + 24]}
+            return
 
-    # Also check category
-    if category == "crisis":
-        crisis_response = (
-            "I'm concerned about what you've shared. If you're in immediate danger, please call emergency services (911) or your local crisis hotline right away.\n\n"
-            "**Crisis Resources:**\n"
-            "• National Suicide Prevention Lifeline: 988 (24/7)\n"
-            "• Crisis Text Line: Text HOME to 741741\n"
-            "• International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/\n\n"
-            "This message has been flagged for immediate human review. A trained professional will reach out to provide support. You are not alone, and help is available."
-        )
-        return crisis_response
+    if category == "crisis" or any(kw in lower_message for kw in crisis_keywords):
+        for i in range(0, len(crisis_response), 24):
+            yield {"type": "delta", "text": crisis_response[i : i + 24]}
+        return
 
-    if USE_OPENAI and openai_client != MockOpenAI:
-        try:
-            # CRISIS CHECK: If crisis detected, return immediately (don't call OpenAI)
-            if category == "crisis" or any(
-                kw in lower_message for kw in crisis_keywords
-            ):
-                crisis_response = (
-                    "I'm concerned about what you've shared. If you're in immediate danger, please call emergency services (911) or your local crisis hotline right away.\n\n"
-                    "**Crisis Resources:**\n"
-                    "• National Suicide Prevention Lifeline: 988 (24/7)\n"
-                    "• Crisis Text Line: Text HOME to 741741\n"
-                    "• International Association for Suicide Prevention: https://www.iasp.info/resources/Crisis_Centres/\n\n"
-                    "This message has been flagged for immediate human review. A trained professional will reach out to provide support. You are not alone, and help is available."
-                )
-                return crisis_response
-
-            # Build system prompt with PII handling instructions
-            system_prompt = """You are a helpful AI assistant that answers questions directly and accurately. Your role is to:
+    system_prompt = """You are a helpful AI assistant that answers questions directly and accurately. Your role is to:
 
 1. **Answer questions directly and helpfully** - Provide clear, accurate answers to user questions
 2. **For simple factual questions** (like "What is 2+2?" or "Capital of France?"):
@@ -1449,32 +1905,64 @@ async def generate_ai_response(
 
 Remember: Answer the question first, then add safety context only when needed. Don't just talk about AI safety - actually help the user with their question. For PII-related queries, provide clear privacy education without repetition."""
 
-            # Add context to user message if PII or crisis was detected
-            user_prompt = user_message
-            if pii_types and len(pii_types) > 0:
-                user_prompt = f"[SYSTEM NOTE: Personal information was detected and redacted in the user's original message. Respond with the exact privacy education message as specified in your instructions.]\n\nUser message: {user_message}"
-            elif category == "crisis":
-                user_prompt = f"[SYSTEM NOTE: This message has been flagged as CRISIS content. Respond with immediate crisis resources and support information as specified in your instructions. DO NOT give generic AI safety discussions.]\n\nUser message: {user_message}"
+    user_prompt = user_message
+    if pii_types and len(pii_types) > 0:
+        user_prompt = f"[SYSTEM NOTE: Personal information was detected and redacted in the user's original message. Respond with the exact privacy education message as specified in your instructions.]\n\nUser message: {user_message}"
+    elif category == "crisis":
+        user_prompt = f"[SYSTEM NOTE: This message has been flagged as CRISIS content. Respond with immediate crisis resources and support information as specified in your instructions. DO NOT give generic AI safety discussions.]\n\nUser message: {user_message}"
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-            response = openai_client.chat.completions.create(
+    accumulated = ""
+
+    if uses_real_openai_api():
+        try:
+            stream = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=messages,
                 temperature=0.7,
                 max_tokens=300,
+                stream=True,
             )
-
-            return response.choices[0].message.content.strip()
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                accumulated += delta
+                viol = stream_output_safety_lite(accumulated)
+                if viol:
+                    yield {
+                        "type": "safety_violation",
+                        "category": viol,
+                        "reason": "assistant_output_stream_safety",
+                    }
+                    return
+                yield {"type": "delta", "text": delta}
+            return
         except Exception as e:
-            # Fallback to mock response on OpenAI API error
-            print(f"⚠️ OpenAI API error: {e}")
-            return openai_client.generate_response(user_message, category, pii_types)
-    else:
-        return openai_client.generate_response(user_message, category, pii_types)
+            print(f"⚠️ OpenAI streaming error: {e}")
+            # fall through to MockOpenAI chunked streaming (official client has no generate_response)
+
+    text = MockOpenAI.generate_response(user_message, category, pii_types)
+    chunk_size = 16
+    for i in range(0, len(text), chunk_size):
+        piece = text[i : i + chunk_size]
+        accumulated += piece
+        viol = stream_output_safety_lite(accumulated)
+        if viol:
+            yield {
+                "type": "safety_violation",
+                "category": viol,
+                "reason": "assistant_output_stream_safety",
+            }
+            return
+        yield {"type": "delta", "text": piece}
+        await asyncio.sleep(0)
 
 
 # API Endpoints
@@ -1612,7 +2100,7 @@ async def get_conversation_history(
     return history
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat(
     request: ChatRequest,
     current_user: User = Depends(get_current_user),
@@ -1628,9 +2116,21 @@ async def chat(
 
     original_message = request.message.strip()
 
-    # Detect and redact PII BEFORE any processing or storage
+    # Full redaction for database storage (never persist raw PII in content)
     redacted_message, pii_types, pii_warning = detect_and_redact_pii(original_message)
-    user_message = redacted_message  # Use redacted version for all processing
+    # Contextual placeholders for the LLM (Names, Locations, Phones) + mapping for optional unmask
+    masked_for_llm, pii_mapping = mask_pii_contextually(original_message)
+
+    db_user_message = redacted_message
+    llm_user_message = masked_for_llm
+
+    # Enrich PII type tags when contextual masks were applied
+    if pii_mapping:
+        for key in pii_mapping:
+            inner = key.strip("{}").split("_", 1)[0].lower()
+            tag = f"masked_{inner}"
+            if tag not in pii_types:
+                pii_types.append(tag)
 
     # Get or create conversation
     # If session_id provided, use it; otherwise create new one
@@ -1714,13 +2214,15 @@ async def chat(
         # No conversation found, starting fresh
         pass
 
-    # Check safety filter FIRST (needed for context analysis)
-    category, confidence = check_safety_filter(user_message)
+    # LLM-based intent classification (masked text preserves semantics for the model)
+    intent = await classify_message_intent(llm_user_message)
+    category = None if intent["category"] == "safe" else intent["category"]
+    confidence = float(intent["confidence_score"]) if category else 0.0
     flagged = category is not None
 
     # CRITICAL: Double-check for crisis content if not detected
     if category != "crisis":
-        lower_user_message = user_message.lower()
+        lower_user_message = llm_user_message.lower()
         crisis_keywords_check = [
             "i want to die",
             "want to die",
@@ -1756,7 +2258,7 @@ async def chat(
     try:
         context_analysis_dict = analyze_conversation_context(
             conversation_history=conversation_history,
-            new_message=user_message,
+            new_message=db_user_message,
             new_category=category,
             confidence=confidence if flagged else 0.0,
         )
@@ -1803,245 +2305,354 @@ async def chat(
 
         await asyncio.sleep(0.1)  # 100ms delay for additional safety checks
 
-    # Generate AI response (pass PII types for appropriate handling)
-    ai_response = await generate_ai_response(user_message, category, pii_types)
-
-    # Calculate confidence score for AI response
-    confidence_score, confidence_level, confidence_reasons = calculate_confidence_score(
-        user_message, ai_response, category
-    )
-
-    # Auto-flag based on confidence (adjusted by safety level setting)
-    confidence_flagged = confidence_score < confidence_threshold
-
-    # CRISIS CONTENT: Always flag regardless of confidence threshold
-    if category == "crisis":
-        confidence_flagged = True
-
-    # Add context-based flagging
-    context_flagged = False
-    if (
-        context_analysis.risk_escalation
-        or context_analysis.filter_bypass_attempt
-        or context_analysis.persistent_sensitive_topic
-    ):
-        context_flagged = True
-        # Adjust confidence score based on cumulative risk
-        if context_analysis.cumulative_risk_score > 0.6:
-            confidence_score = max(
-                0, confidence_score - 15
-            )  # Lower confidence for high cumulative risk
-
-    final_flagged = flagged or confidence_flagged or context_flagged
-
-    # CRISIS CONTENT: Ensure it's always flagged
-    if category == "crisis":
-        final_flagged = True
-
-    # Calculate priority level now that we have confidence_score
-    priority_level = "low"
-    escalation_reason = None
-    target_response_time = 60  # Default
-
-    if final_flagged:
-        priority_level, escalation_reason, target_response_time = calculate_priority(
-            category=category,
-            confidence=confidence,
-            content=user_message,
-            confidence_score=confidence_score,
+    # Long-term risk memory: compare current message to prior flagged / medium-confidence history
+    historical_risk_escalation = False
+    historical_risk_note: Optional[str] = None
+    try:
+        hr = await check_historical_risk_patterns(
+            db, current_user.id, db_user_message
         )
-        # Log priority calculation for debugging (critical for crisis detection)
-        if priority_level == "critical":
-            print(
-                f"🚨 Priority calculated: {priority_level.upper()} - {escalation_reason} (target: {target_response_time} min)"
+        if hr.get("escalating"):
+            historical_risk_escalation = True
+            historical_risk_note = hr.get("note")
+            flagged = True
+            logger.warning(
+                "historical_risk_escalation user=%s note=%r",
+                current_user.id,
+                historical_risk_note,
+            )
+    except Exception as e:
+        logger.warning("check_historical_risk_patterns failed: %s", e)
+
+    def finalize_chat_turn(
+        ai_response: str,
+        stream_safety_stopped: bool = False,
+    ) -> ChatResponse:
+        # Calculate confidence score for AI response
+        confidence_score, confidence_level, confidence_reasons = calculate_confidence_score(
+            llm_user_message, ai_response, category
+        )
+
+        # Auto-flag based on confidence (adjusted by safety level setting)
+        confidence_flagged = confidence_score < confidence_threshold
+
+        # CRISIS CONTENT: Always flag regardless of confidence threshold
+        if category == "crisis":
+            confidence_flagged = True
+
+        # Add context-based flagging
+        context_flagged = False
+        if (
+            context_analysis.risk_escalation
+            or context_analysis.filter_bypass_attempt
+            or context_analysis.persistent_sensitive_topic
+        ):
+            context_flagged = True
+            # Adjust confidence score based on cumulative risk
+            if context_analysis.cumulative_risk_score > 0.6:
+                confidence_score = max(
+                    0, confidence_score - 15
+                )  # Lower confidence for high cumulative risk
+
+        final_flagged = flagged or confidence_flagged or context_flagged
+
+        # Mid-stream assistant output safety stop: always flag for moderator review
+        if stream_safety_stopped:
+            final_flagged = True
+
+        # CRISIS CONTENT: Ensure it's always flagged
+        if category == "crisis":
+            final_flagged = True
+
+        # Long-term risk memory: escalating pattern across prior sessions / messages
+        if historical_risk_escalation:
+            final_flagged = True
+
+        # Calculate priority level now that we have confidence_score
+        priority_level = "low"
+        escalation_reason = None
+        target_response_time = 60  # Default
+
+        if final_flagged:
+            priority_level, escalation_reason, target_response_time = calculate_priority(
+                category=category,
+                confidence=confidence,
+                content=llm_user_message,
+                confidence_score=confidence_score,
+            )
+            if historical_risk_escalation:
+                priority_level = "critical"
+                escalation_reason = (
+                    f"Contextual Risk: {historical_risk_note}"
+                    if historical_risk_note
+                    else "Contextual Risk: escalating pattern from prior flagged or medium-confidence interactions"
+                )
+                target_response_time = 0
+            # Log priority calculation for debugging (critical for crisis detection)
+            if priority_level == "critical":
+                print(
+                    f"🚨 Priority calculated: {priority_level.upper()} - {escalation_reason} (target: {target_response_time} min)"
+                )
+
+        # Add warning for very low confidence
+        if confidence_score < 30.0:
+            confidence_reasons.append("AI is uncertain about this response")
+
+        if historical_risk_escalation:
+            confidence_reasons.append(
+                "Contextual Risk: prior interactions suggest an escalating risk pattern"
             )
 
-    # Add warning for very low confidence
-    if confidence_score < 30.0:
-        confidence_reasons.append("AI is uncertain about this response")
+        # Generate guardrail explanation if transparency is enabled
+        guardrail_explanation = None
+        if settings.transparency and (final_flagged or category):
+            if stream_safety_stopped:
+                guardrail_explanation = (
+                    "Guardrail triggered: Assistant response was stopped mid-stream by the output safety filter."
+                )
+            elif category == "crisis":
+                guardrail_explanation = (
+                    "Guardrail triggered: Crisis content detected. This query was flagged for review to ensure appropriate handling."
+                )
+            elif historical_risk_escalation:
+                guardrail_explanation = (
+                    "Guardrail triggered: Long-term risk memory suggests an escalating pattern compared to your prior "
+                    "flagged or medium-confidence interactions. This turn was prioritized for human review."
+                )
+            elif category:
+                category_names = {
+                    "medical": "Medical",
+                    "financial": "Financial",
+                    "legal": "Legal",
+                    "crisis": "Crisis",
+                }
+                category_name = category_names.get(category, category)
+                guardrail_explanation = f"Guardrail triggered: {category_name} content detected. This query was flagged for review to ensure appropriate handling."
+            elif confidence_flagged:
+                guardrail_explanation = f"Guardrail triggered: Low confidence response ({confidence_score:.0f}%). This response may be inaccurate or uncertain."
 
-    # Generate guardrail explanation if transparency is enabled
-    guardrail_explanation = None
-    if settings.transparency and (final_flagged or category):
-        if category:
+        # CRISIS CONTENT: Always store for safety, regardless of data_logging setting
+        if category == "crisis":
+            store_messages = True
+        else:
+            # Store messages based on data_logging setting
+            # NOTE: If data_logging is False, we still need to store messages temporarily for context analysis
+            # In production, you might want to implement in-memory context tracking for privacy
+            # For now, we respect the setting but note that context analysis requires message history
+            store_messages = settings.data_logging
+            # Note: Messages are still processed for context analysis even if data_logging is False
+            # In production, you might want to implement in-memory context tracking for privacy
+            if not store_messages:
+                store_messages = True  # Temporary: allow context analysis to work
+
+        if store_messages:
+            # Store user message (ONLY redacted version - never store raw PII)
+            user_msg = Message(
+                conversation_id=conversation.id,
+                role="user",
+                content=db_user_message,
+                category=category or "safe",
+                confidence=confidence if flagged else None,
+                confidence_score=None,  # User messages don't have confidence scores
+                confidence_level=None,  # User messages don't have confidence levels
+                flagged=flagged,
+                pii_detected=len(pii_types) > 0,
+                pii_types=pii_types
+                if pii_types
+                else None,  # SQLAlchemy JSON will serialize this
+                pii_placeholder_mapping=pii_mapping if pii_mapping else None,
+                timestamp=datetime.now(timezone.utc),
+            )
+            db.add(user_msg)
+            db.commit()
+            db.refresh(user_msg)
+
+            # Store AI response with confidence score and priority
+            ai_msg = Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content=ai_response,
+                category=category or "safe",
+                confidence=confidence if flagged else None,
+                confidence_score=confidence_score,
+                confidence_level=confidence_level,
+                flagged=final_flagged,
+                priority_level=priority_level if final_flagged else None,
+                escalation_reason=escalation_reason if final_flagged else None,
+                target_response_time=target_response_time if final_flagged else None,
+                timestamp=datetime.now(timezone.utc),
+            )
+            db.add(ai_msg)
+            db.commit()
+            db.refresh(ai_msg)
+
+            pass  # Messages stored successfully
+        else:
+            pass  # Data logging disabled
+
+        # Create message for moderator
+        if final_flagged:
             category_names = {
                 "medical": "Medical",
                 "financial": "Financial",
                 "legal": "Legal",
                 "crisis": "Crisis",
             }
-            category_name = category_names.get(category, category)
-            guardrail_explanation = f"Guardrail triggered: {category_name} content detected. This query was flagged for review to ensure appropriate handling."
-        elif confidence_flagged:
-            guardrail_explanation = f"Guardrail triggered: Low confidence response ({confidence_score:.0f}%). This response may be inaccurate or uncertain."
+            category_name = (
+                category_names.get(category, category) if category else "Low Confidence"
+            )
 
-    # CRISIS CONTENT: Always store for safety, regardless of data_logging setting
-    if category == "crisis":
-        store_messages = True
-    else:
-        # Store messages based on data_logging setting
-        # NOTE: If data_logging is False, we still need to store messages temporarily for context analysis
-        # In production, you might want to implement in-memory context tracking for privacy
-        # For now, we respect the setting but note that context analysis requires message history
-        store_messages = settings.data_logging
-        # Note: Messages are still processed for context analysis even if data_logging is False
-        # In production, you might want to implement in-memory context tracking for privacy
-        if not store_messages:
-            store_messages = True  # Temporary: allow context analysis to work
+            flag_reasons = []
+            if stream_safety_stopped:
+                flag_reasons.append("assistant output safety kill-switch (stream)")
+            if historical_risk_escalation:
+                flag_reasons.append(
+                    f"Contextual Risk: {historical_risk_note or 'Escalating pattern vs prior flagged or medium-confidence history'}"
+                )
+            if flagged:
+                flag_reasons.append(f"{category_name.lower()} content")
+            if confidence_flagged:
+                flag_reasons.append(f"low confidence ({confidence_score:.0f}%)")
+            if context_flagged:
+                if context_analysis.risk_escalation:
+                    flag_reasons.append("risk escalation")
+                if context_analysis.filter_bypass_attempt:
+                    flag_reasons.append("possible filter bypass")
+                if context_analysis.persistent_sensitive_topic:
+                    flag_reasons.append("persistent sensitive queries")
 
-    if store_messages:
-        # Store user message (ONLY redacted version - never store raw PII)
-        user_msg = Message(
-            conversation_id=conversation.id,
-            role="user",
-            content=user_message,  # Redacted version only
+            if flag_reasons:
+                message_for_moderator = (
+                    f"Flagged for: {', '.join(flag_reasons)}. Message: {db_user_message[:100]}"
+                )
+            else:
+                message_for_moderator = f"Flagged: {db_user_message[:100]}"
+        else:
+            message_for_moderator = "No safety concerns detected"
+
+        # Generate learning analysis if learning mode is enabled
+        learning_analysis = None
+        learning_mode_enabled = settings.learning_mode or request.learning_mode
+
+        if learning_mode_enabled:
+            try:
+                learning_analysis_dict = generate_learning_analysis(
+                    user_message=db_user_message,
+                    category=category,
+                    flagged=final_flagged,
+                    confidence_score=confidence_score,
+                    confidence_level=confidence_level,
+                    confidence_reasons=confidence_reasons,
+                    pii_types=pii_types,
+                )
+                # Add context analysis to learning analysis
+                # Pydantic v2 uses model_dump(), v1 uses dict()
+                try:
+                    if hasattr(context_analysis, "model_dump"):
+                        context_dict = context_analysis.model_dump()
+                    elif hasattr(context_analysis, "dict"):
+                        context_dict = context_analysis.dict()
+                    else:
+                        # Fallback: manually extract
+                        context_dict = {
+                            "risk_escalation": context_analysis.risk_escalation,
+                            "filter_bypass_attempt": context_analysis.filter_bypass_attempt,
+                            "cumulative_risk_score": context_analysis.cumulative_risk_score,
+                            "persistent_sensitive_topic": context_analysis.persistent_sensitive_topic,
+                            "context_flags": context_analysis.context_flags,
+                            "previous_queries": context_analysis.previous_queries,
+                        }
+                except Exception as e:
+                    # Fallback: manually extract context analysis data
+                    print(f"⚠️ Error converting context_analysis to dict: {e}")
+                    context_dict = {
+                        "risk_escalation": getattr(
+                            context_analysis, "risk_escalation", False
+                        ),
+                        "filter_bypass_attempt": getattr(
+                            context_analysis, "filter_bypass_attempt", False
+                        ),
+                        "cumulative_risk_score": getattr(
+                            context_analysis, "cumulative_risk_score", 0.0
+                        ),
+                        "persistent_sensitive_topic": getattr(
+                            context_analysis, "persistent_sensitive_topic", False
+                        ),
+                        "context_flags": getattr(context_analysis, "context_flags", []),
+                        "previous_queries": getattr(
+                            context_analysis, "previous_queries", []
+                        ),
+                    }
+
+                learning_analysis_dict["context_analysis"] = context_dict
+                learning_analysis = LearningAnalysis(**learning_analysis_dict)
+            except Exception as e:
+                # Log error but continue without learning analysis
+                print(f"⚠️ Error generating learning analysis: {e}")
+                learning_analysis = None
+
+        return ChatResponse(
+            response=ai_response,
             category=category or "safe",
-            confidence=confidence if flagged else None,
-            confidence_score=None,  # User messages don't have confidence scores
-            confidence_level=None,  # User messages don't have confidence levels
-            flagged=flagged,
-            pii_detected=len(pii_types) > 0,
-            pii_types=pii_types
-            if pii_types
-            else None,  # SQLAlchemy JSON will serialize this
-            timestamp=datetime.now(timezone.utc),
-        )
-        db.add(user_msg)
-        db.commit()
-        db.refresh(user_msg)
-
-        # Store AI response with confidence score and priority
-        ai_msg = Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=ai_response,
-            category=category or "safe",
-            confidence=confidence if flagged else None,
+            confidence=confidence if flagged else 1.0,
             confidence_score=confidence_score,
             confidence_level=confidence_level,
+            confidence_reasons=confidence_reasons,
             flagged=final_flagged,
-            priority_level=priority_level if final_flagged else None,
-            escalation_reason=escalation_reason if final_flagged else None,
-            target_response_time=target_response_time if final_flagged else None,
-            timestamp=datetime.now(timezone.utc),
-        )
-        db.add(ai_msg)
-        db.commit()
-        db.refresh(ai_msg)
-
-        pass  # Messages stored successfully
-    else:
-        pass  # Data logging disabled
-
-    # Create message for moderator
-    if final_flagged:
-        category_names = {
-            "medical": "Medical",
-            "financial": "Financial",
-            "legal": "Legal",
-            "crisis": "Crisis",
-        }
-        category_name = (
-            category_names.get(category, category) if category else "Low Confidence"
+            message_for_moderator=message_for_moderator,
+            session_id=session_id,
+            pii_warning=pii_warning if pii_warning else None,
+            learning_analysis=learning_analysis,
+            guardrail_explanation=guardrail_explanation,
         )
 
-        flag_reasons = []
-        if flagged:
-            flag_reasons.append(f"{category_name.lower()} content")
-        if confidence_flagged:
-            flag_reasons.append(f"low confidence ({confidence_score:.0f}%)")
-        if context_flagged:
-            if context_analysis.risk_escalation:
-                flag_reasons.append("risk escalation")
-            if context_analysis.filter_bypass_attempt:
-                flag_reasons.append("possible filter bypass")
-            if context_analysis.persistent_sensitive_topic:
-                flag_reasons.append("persistent sensitive queries")
+    if request.stream:
 
-        if flag_reasons:
-            message_for_moderator = (
-                f"Flagged for: {', '.join(flag_reasons)}. Message: {user_message[:100]}"
+        async def ndjson_stream() -> AsyncIterator[str]:
+            accumulated_ai = ""
+            stream_safety_stopped = False
+            async for ev in stream_ai_response_chunks(
+                llm_user_message, category, pii_types
+            ):
+                if ev["type"] == "delta":
+                    accumulated_ai += ev["text"]
+                    yield json.dumps(ev) + "\n"
+                elif ev["type"] == "safety_violation":
+                    stream_safety_stopped = True
+                    logger.warning(
+                        "stream_safety_kill_switch user=%s session=%s category=%s reason=%s snippet=%r",
+                        current_user.id,
+                        session_id,
+                        ev.get("category"),
+                        ev.get("reason"),
+                        (accumulated_ai[-200:] if accumulated_ai else ""),
+                    )
+                    yield json.dumps(ev) + "\n"
+                    break
+            if stream_safety_stopped:
+                accumulated_ai += "\n\n[Response stopped by safety filter.]"
+            resp = finalize_chat_turn(accumulated_ai, stream_safety_stopped)
+            done_payload = (
+                resp.model_dump(mode="json")
+                if hasattr(resp, "model_dump")
+                else resp.dict()
             )
-        else:
-            message_for_moderator = f"Flagged: {user_message[:100]}"
-    else:
-        message_for_moderator = "No safety concerns detected"
+            yield json.dumps({"type": "done", **done_payload}) + "\n"
 
-    # Generate learning analysis if learning mode is enabled
-    learning_analysis = None
-    learning_mode_enabled = settings.learning_mode or request.learning_mode
+        return StreamingResponse(
+            ndjson_stream(),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
-    if learning_mode_enabled:
-        try:
-            learning_analysis_dict = generate_learning_analysis(
-                user_message=user_message,
-                category=category,
-                flagged=final_flagged,
-                confidence_score=confidence_score,
-                confidence_level=confidence_level,
-                confidence_reasons=confidence_reasons,
-                pii_types=pii_types,
-            )
-            # Add context analysis to learning analysis
-            # Pydantic v2 uses model_dump(), v1 uses dict()
-            try:
-                if hasattr(context_analysis, "model_dump"):
-                    context_dict = context_analysis.model_dump()
-                elif hasattr(context_analysis, "dict"):
-                    context_dict = context_analysis.dict()
-                else:
-                    # Fallback: manually extract
-                    context_dict = {
-                        "risk_escalation": context_analysis.risk_escalation,
-                        "filter_bypass_attempt": context_analysis.filter_bypass_attempt,
-                        "cumulative_risk_score": context_analysis.cumulative_risk_score,
-                        "persistent_sensitive_topic": context_analysis.persistent_sensitive_topic,
-                        "context_flags": context_analysis.context_flags,
-                        "previous_queries": context_analysis.previous_queries,
-                    }
-            except Exception as e:
-                # Fallback: manually extract context analysis data
-                print(f"⚠️ Error converting context_analysis to dict: {e}")
-                context_dict = {
-                    "risk_escalation": getattr(
-                        context_analysis, "risk_escalation", False
-                    ),
-                    "filter_bypass_attempt": getattr(
-                        context_analysis, "filter_bypass_attempt", False
-                    ),
-                    "cumulative_risk_score": getattr(
-                        context_analysis, "cumulative_risk_score", 0.0
-                    ),
-                    "persistent_sensitive_topic": getattr(
-                        context_analysis, "persistent_sensitive_topic", False
-                    ),
-                    "context_flags": getattr(context_analysis, "context_flags", []),
-                    "previous_queries": getattr(
-                        context_analysis, "previous_queries", []
-                    ),
-                }
-
-            learning_analysis_dict["context_analysis"] = context_dict
-            learning_analysis = LearningAnalysis(**learning_analysis_dict)
-        except Exception as e:
-            # Log error but continue without learning analysis
-            print(f"⚠️ Error generating learning analysis: {e}")
-            learning_analysis = None
-
-    return ChatResponse(
-        response=ai_response,
-        category=category or "safe",
-        confidence=confidence if flagged else 1.0,
-        confidence_score=confidence_score,
-        confidence_level=confidence_level,
-        confidence_reasons=confidence_reasons,
-        flagged=final_flagged,
-        message_for_moderator=message_for_moderator,
-        session_id=session_id,
-        pii_warning=pii_warning if pii_warning else None,
-        learning_analysis=learning_analysis,
-        guardrail_explanation=guardrail_explanation,
+    # Generate AI response (masked user text; DB stores redacted only)
+    ai_response, stream_killed = await generate_ai_response(
+        llm_user_message, category, pii_types
     )
+    return finalize_chat_turn(ai_response, stream_killed)
 
 
 @app.get("/moderator/queue", response_model=List[FlaggedMessage])

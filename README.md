@@ -4,7 +4,7 @@
 
 <div align="center">
 
-**A comprehensive conversational AI system demonstrating safety guardrails, human-in-the-loop oversight, and responsible AI practices.**
+**Version 2.0.0** — A comprehensive conversational AI system demonstrating safety guardrails, human-in-the-loop oversight, and responsible AI practices.
 
 
 
@@ -20,6 +20,7 @@
 
 - [Overview](#overview)
 - [Why This Matters](#why-this-matters)
+- [Enterprise Features (v2.0.0)](#enterprise-features-v200)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
@@ -36,10 +37,12 @@
 
 **AI Safety Chat** is an educational demonstration system that showcases how AI applications can be built with comprehensive safety mechanisms. The system provides:
 
-- **Real-time Safety Filtering**: Automatic detection of sensitive content (medical, financial, legal, crisis)
+- **LLM-Based Intent Classification**: Semantic intent detection (with keyword fallbacks) for medical, financial, legal, and crisis content
+- **Contextual PII Handling**: Sensitive values masked with placeholders (e.g. `{{NAME_1}}`) for the model while **fully redacted text** is stored in the database
+- **Streaming Safety Pipeline**: Optional NDJSON streaming with a real-time output kill-switch on unsafe assistant text
+- **Long-Term Risk Memory**: Cross-session analysis of prior flagged or medium-confidence interactions to detect escalating behavioral patterns
 - **Confidence Scoring**: AI response confidence analysis (0-100%)
-- **PII Detection & Redaction**: Automatic detection and redaction of personally identifiable information
-- **Priority-Based Escalation**: Automatic priority assignment (Critical, High, Medium, Low) with immediate escalation for crisis content
+- **Priority-Based Escalation**: Automatic priority assignment (Critical, High, Medium, Low) with immediate escalation for crisis and contextual-risk cases
 - **Human-in-the-Loop Oversight**: Moderator dashboard for reviewing flagged content
 - **Multi-turn Context Analysis**: Conversation history tracking and risk escalation detection
 - **User Control Panel**: Configurable safety levels, transparency, learning mode, and data preferences
@@ -48,11 +51,12 @@
 
 The system acts as a conversational AI assistant with built-in safety guardrails. When users interact with the chat:
 
-1. **Messages are analyzed** for safety concerns (medical advice, financial advice, legal queries, crisis content)
-2. **PII is automatically detected and redacted** before storage
-3. **AI responses are generated** with confidence scoring
-4. **Flagged content is escalated** to human moderators based on priority
-5. **Moderators can review, edit, approve, or reject** responses before they're sent
+1. **Messages are classified** for intent (LLM when configured, keyword-based mock otherwise) and checked against safety rules
+2. **PII is detected**: placeholders preserve semantics for the LLM; **persisted message content is redacted** (raw PII is not stored)
+3. **Long-term risk patterns** may be evaluated **before** generation to raise priority and moderator context
+4. **AI responses are generated** (OpenAI streaming or mock chunks) with optional **stream interception** for unsafe output
+5. **Responses receive confidence scoring**; **flagged content is escalated** to human moderators by priority
+6. **Moderators can review, edit, approve, or reject** responses through the dashboard
 
 ### Why This Matters
 
@@ -67,21 +71,35 @@ This educational system demonstrates these principles in a practical, interactiv
 
 ---
 
+## 🏢 Enterprise Features (v2.0.0)
+
+These capabilities represent a **defense-in-depth** safety stack suitable for educational and prototype “enterprise-style” deployments:
+
+| Layer | What it does |
+|--------|----------------|
+| **LLM-Based Intent Classification** | Replaces pure keyword routing with **semantic intent** classification (JSON via OpenAI when enabled; **keyword-based fallback** when no API key). |
+| **Contextual PII Masking** | Builds a **masked view** of the user message for the model using stable placeholders (e.g. `{{NAME_1}}`, `{{PHONE_1}}`) so the LLM keeps context; the **database stores only redacted** content. |
+| **Streaming Kill-Switch** | With `stream: true`, assistant tokens are streamed as **NDJSON** (`delta` lines). A rolling buffer runs **lite output safety** checks; on violation the stream **stops**, emits a `safety_violation` event, and logs for moderators. |
+| **Long-Term Risk Memory** | Queries prior **flagged** or **medium-confidence-related** user history, then uses an **LLM assessment** (or heuristic fallback) to detect **escalating risk** across time; can force **Critical** priority and **Contextual Risk** moderator notes **before** the model responds. |
+
+---
+
 ## ✨ Features
 
 ### Core Safety Features
 
-#### 1. **Safety Filtering System**
-- **Category Detection**: Automatically identifies medical, financial, legal, and crisis content
-- **Keyword-Based Detection**: Pattern matching for sensitive topics
+#### 1. **Safety Filtering & Intent**
+- **Semantic Intent (primary)**: LLM classifies user intent into medical, financial, legal, crisis, or safe when OpenAI is configured
+- **Keyword-Based Fallback**: Same categories via `check_safety_filter` when the LLM path is unavailable
 - **Confidence Scoring**: Calculates AI response confidence (0-100%)
-- **Auto-Flagging**: Flags content below confidence thresholds
+- **Auto-Flagging**: Flags content below configurable confidence thresholds
 
-#### 2. **PII Detection & Redaction (FR-203)**
-- **Detects**: Credit cards, SSN, phone numbers, email addresses, physical addresses
-- **Redacts**: Automatically removes PII before storage
-- **Logs**: Detection events (without raw PII) for security audit
-- **Warns**: User-facing warnings when PII is detected
+#### 2. **PII Detection, Masking & Redaction (FR-203)**
+- **Detects**: Credit cards, SSN, phone numbers, email addresses, physical addresses, and related patterns
+- **For the LLM**: **Contextual masking** — replaces spans with placeholders so meaning (e.g. “contact this person”) is preserved without exposing raw values
+- **For storage**: **Full redaction** in persisted message content — raw PII is not written to the database; optional **placeholder mapping** is stored for authorized workflows
+- **Logs**: Detection metadata (not raw PII) for audit
+- **Warns**: User-facing notice when PII is detected
 
 #### 3. **Automatic Escalation Triggers**
 - **Critical Priority**: Crisis/suicide content → Immediate human review (0 min target)
@@ -152,65 +170,65 @@ This educational system demonstrates these principles in a practical, interactiv
 │         │                  │                  │             │
 │         └──────────────────┼──────────────────┘             │
 │                            │                                 │
-│                    JavaScript (script.js)                   │
+│         script.js (JSON or NDJSON stream reader)            │
 └────────────────────────────┼─────────────────────────────────┘
-                             │ HTTP/REST API
-                             │ (CORS enabled)
+                             │ HTTP/REST API (CORS)
 ┌────────────────────────────┼─────────────────────────────────┐
 │                      Backend (FastAPI)                       │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │              API Endpoints (/chat, /moderator)       │  │
-│  └──────────────────────┬─────────────────────────────┘  │
-│                           │                                │
-│  ┌────────────────────────┼─────────────────────────────┐  │
-│  │   Safety Filter  │  PII Detection  │  Context Analysis│  │
-│  └────────────────────────┼─────────────────────────────┘  │
-│                           │                                │
-│  ┌────────────────────────┼─────────────────────────────┐  │
-│  │  Priority Calculation  │  Confidence Scoring         │  │
-│  └────────────────────────┼─────────────────────────────┘  │
-│                           │                                │
-│  ┌────────────────────────┼─────────────────────────────┐  │
-│  │  OpenAI API (optional) │  Mock AI (fallback)         │  │
-│  └────────────────────────┼─────────────────────────────┘  │
-│                           │                                │
-│  ┌────────────────────────┼─────────────────────────────┐  │
-│  │         SQLAlchemy ORM (Database Layer)              │  │
-│  └────────────────────────┼─────────────────────────────┘  │
-└────────────────────────────┼─────────────────────────────────┘
-                             │
-┌────────────────────────────┼─────────────────────────────────┐
-│                    SQLite Database                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
-│  │  users   │  │conversat.│  │ messages │  │moderator │  │
-│  │          │  │          │  │          │  │decisions │  │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
-└─────────────────────────────────────────────────────────────┘
+│  │         API (/chat, /moderator, …)                    │  │
+│  └──────────────────────┬───────────────────────────────┘  │
+│                         │                                   │
+│  ┌──────────────────────┼───────────────────────────────┐  │
+│  │ PII: redact (DB) + contextual mask (LLM input)      │  │
+│  │ Intent Classifier (LLM JSON) │ keyword fallback      │  │
+│  └──────────────────────┼───────────────────────────────┘  │
+│  ┌──────────────────────┼───────────────────────────────┐  │
+│  │ Risk Memory module │ prior flagged / med-conf. msgs │  │
+│  │ Context Analysis   │ conversation history            │  │
+│  └──────────────────────┼───────────────────────────────┘  │
+│  ┌──────────────────────┼───────────────────────────────┐  │
+│  │ OpenAI chat.completions (stream) │ MockOpenAI chunks   │  │
+│  │ Streaming Interceptor: output buffer + kill-switch    │  │
+│  └──────────────────────┼───────────────────────────────┘  │
+│  ┌──────────────────────┼───────────────────────────────┐  │
+│  │ Priority │ Confidence scoring │ finalize turn         │  │
+│  └──────────────────────┼───────────────────────────────┘  │
+│  ┌──────────────────────┼───────────────────────────────┐  │
+│  │              SQLAlchemy ORM → SQLite                  │  │
+│  └──────────────────────┼───────────────────────────────┘  │
+└──────────────────────────┼───────────────────────────────────┘
+                           │
+┌──────────────────────────┼───────────────────────────────────┐
+│                    SQLite Database                           │
+│  users │ conversations │ messages │ moderator_decisions      │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 
 1. **User sends message** → Frontend (`script.js`)
-2. **Frontend sends POST /chat** → Backend (`app.py`)
-3. **Backend processes**:
-   - PII Detection & Redaction
-   - Safety Filter (category detection)
-   - Context Analysis (conversation history)
-   - Priority Calculation
-   - AI Response Generation (OpenAI or Mock)
-   - Confidence Scoring
-4. **Backend stores** → SQLite Database
-5. **Backend returns** → Response with metadata
-6. **Frontend displays** → Chat UI with badges and analysis
+2. **Frontend sends POST /chat** (JSON body; optional `stream: true` for NDJSON) → Backend (`app.py`)
+3. **Backend processes (order matters)**:
+   - **PII**: detect → **redact** for persistence → **mask** for LLM
+   - **Intent classification** (LLM or keyword mock)
+   - **Context analysis** (in-session history)
+   - **Long-term Risk Memory** (cross-session DB lookup + escalation assessment) — runs **before** generation
+   - **AI generation**: OpenAI **`stream=True`** or mock chunked text
+   - **Streaming Interceptor**: rolling buffer + lite safety on assistant text; may emit `safety_violation` and stop
+   - **Confidence scoring** and **priority** (including contextual-risk overrides)
+4. **Backend stores** → SQLite (redacted user content, assistant reply, flags, priority)
+5. **Backend returns** → Single JSON **`ChatResponse`**, or **NDJSON** stream (`delta` / `safety_violation` / final `done` with full metadata)
+6. **Frontend displays** → Chat UI with badges, warnings, and streamed text when enabled
 
 ### Technology Stack
 
-- **Frontend**: HTML5, CSS3, JavaScript (ES6+), Font Awesome
+- **Frontend**: HTML5, CSS3, JavaScript (ES6+), Font Awesome, `ReadableStream` NDJSON client for streaming chat
 - **Backend**: Python 3.8+, FastAPI, Uvicorn
 - **Database**: SQLite with SQLAlchemy ORM
-- **AI**: OpenAI GPT-3.5-turbo (optional) or Mock responses
+- **AI**: OpenAI GPT-3.5-turbo (`chat.completions` streaming, intent JSON, risk assessment) or `MockOpenAI` fallback
 - **Authentication**: JWT tokens with Passlib/Bcrypt
-- **Security**: CORS middleware, PII redaction, input validation
+- **Security**: CORS middleware, PII masking + redaction, stream output safety phrases, input validation
 
 ---
 
@@ -390,6 +408,7 @@ The frontend is pre-configured to connect to `http://localhost:8000`. To change 
 - `flagged` (Boolean, Indexed)
 - `pii_detected` (Boolean, Indexed)
 - `pii_types` (JSON) - List of detected PII types
+- `pii_placeholder_mapping` (JSON, Optional) - Maps placeholders (e.g. `{{NAME_1}}`) to spans for authorized display workflows; persisted user `content` remains redacted
 - `priority_level` (String: "critical", "high", "medium", "low", Indexed)
 - `escalation_reason` (Text) - Why it was escalated
 - `target_response_time` (Integer) - Target response time in minutes
@@ -429,6 +448,7 @@ Send a chat message and receive an AI response with safety metadata.
   "message": "I have a headache",
   "learning_mode": false,
   "session_id": "optional-session-id",
+  "stream": false,
   "settings": {
     "safety_level": "moderate",
     "transparency": true,
@@ -439,7 +459,9 @@ Send a chat message and receive an AI response with safety metadata.
 }
 ```
 
-**Response:**
+- **`stream`**: If `true`, the response is **`application/x-ndjson`**: newline-delimited JSON events (`{"type":"delta","text":"..."}`, optional `{"type":"safety_violation",...}`, then `{"type":"done",...}` with the same fields as the JSON response below). If `false` or omitted, the response is a single JSON object (default for simple clients and tests).
+
+**Response (when `stream` is false):**
 ```json
 {
   "response": "AI response text...",
@@ -709,8 +731,8 @@ python backend/init_db.py
 
 ## 📚 Additional Resources
 
-- **User Guide**: See [UserGuide.md](UserGuide.md) for detailed usage instructions
-- **API Documentation**: Interactive docs at `http://localhost:8000/docs` (Swagger UI)
+- **User Guide**: See [UserGuide.md](UserGuide.md) for v2.0.0 usage (streaming chat, PII masking, moderator queue)
+- **API Documentation**: Interactive docs at `http://localhost:8000/docs` (Swagger UI); `GET /` reports `"version": "2.0.0"`
 - **FastAPI Documentation**: https://fastapi.tiangolo.com/
 - **SQLAlchemy Documentation**: https://docs.sqlalchemy.org/
 

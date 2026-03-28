@@ -1,15 +1,27 @@
 # AI Safety Chat - User Guide
 
-Complete guide for using the AI Safety Chat system as both a regular user and a moderator.
+**Version 2.0.0** — Complete guide for using the AI Safety Chat system as both a regular user and a moderator. This document matches the current backend behavior (LLM intent, contextual PII masking, streaming kill-switch, long-term risk memory).
 
 ---
 
 ## 📋 Table of Contents
 
+- [What's New in v2.0.0](#whats-new-in-v200)
 - [For Regular Users](#for-regular-users)
 - [For Moderators](#for-moderators)
 - [Testing Scenarios](#testing-scenarios)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## What's New in v2.0.0
+
+| Capability | User-visible effect |
+|------------|---------------------|
+| **LLM intent classification** | Sensitive topics are classified semantically when the API is configured; behavior is unchanged when using offline/mock mode. |
+| **Contextual PII masking** | The assistant can still understand *that* you mentioned a name or phone, but the app **stores redacted text** in the database—not raw PII. |
+| **Streaming + kill-switch** | The default web UI requests **streaming** replies; unsafe assistant output can be **cut off mid-stream** with a safety notice. |
+| **Long-term risk memory** | If you have prior flagged or borderline interactions, the system may raise **priority** and add **“Contextual Risk”** notes for moderators—**before** the reply is generated. |
 
 ---
 
@@ -24,7 +36,7 @@ Complete guide for using the AI Safety Chat system as both a regular user and a 
 2. **Start Chatting**
    - Type your message in the input box
    - Click the send button (or press Enter)
-   - Wait for the AI response
+   - The reply **streams in** token-by-token (NDJSON), then final safety metadata appears on the completed message
 
 ### Understanding the Interface
 
@@ -46,7 +58,7 @@ Complete guide for using the AI Safety Chat system as both a regular user and a 
 If you share personal information (email, phone, SSN, credit card, address), you'll see a purple warning bar:
 > ⚠️ **I've removed personal information for your safety.**
 
-This means the system detected and redacted your PII before storing it.
+The system **detects** PII, **masks** it for the model with placeholders (so the AI keeps useful context), and **stores only redacted content** in the database—raw secrets are not persisted.
 
 #### Guardrail Explanations
 
@@ -158,10 +170,10 @@ When **Learning Mode** is enabled, you'll see detailed analysis below AI respons
 
 Messages are sorted by priority (highest first):
 
-- **🔴 CRITICAL**: Crisis/suicide content
+- **🔴 CRITICAL**: Crisis/suicide content **or** contextual long-term risk escalation
   - Target: Immediate (0 minutes)
   - Pulsing red animation
-  - Examples: "I want to die", "kill myself"
+  - Examples: "I want to die", "kill myself"; repeated prior risk + escalating current message (see **Contextual Risk** in queue text)
 
 - **🟠 HIGH**: Medical advice, illegal activity, high toxicity
   - Target: < 5 minutes
@@ -339,13 +351,14 @@ After taking action, messages move to the "Reviewed Items" section showing:
 
 ### PII Detection
 
-**Test**: Verify PII is detected and redacted.
+**Test**: Verify PII is detected, masked for the model, and redacted for storage.
 
 **Steps**:
 1. Send: "My email is test@example.com"
 2. **Expected**:
    - PII warning bar appears
-   - Message stored as: "My email is [REDACTED]"
+   - Persisted user message content is **redacted** (not the raw email)
+   - The model still receives a **masked** form so it can respond appropriately
    - AI response includes privacy education
    - `pii_detected: true` in database
 
@@ -483,12 +496,7 @@ After taking action, messages move to the "Reviewed Items" section showing:
 **Solutions**:
 1. **Check backend logs** for `🚨 CRISIS DETECTED` messages
 2. **Verify backend server was restarted** after code changes
-3. **Check crisis keywords** in `backend/app.py`:
-   ```python
-   SAFETY_KEYWORDS = {
-       "crisis": ["i want to die", "kill myself", ...]
-   }
-   ```
+3. **Intent path**: With `OPENAI_API_KEY` set, crisis may be surfaced via **LLM intent JSON**; without it, **keyword-based** `check_safety_filter` / crisis lists still apply—see `backend/app.py`
 
 ### Messages Not Appearing in Moderator Queue
 
@@ -637,4 +645,4 @@ After taking action, messages move to the "Reviewed Items" section showing:
 
 ---
 
-**Last Updated**: January 2026
+**Last Updated**: March 2026 (v2.0.0)

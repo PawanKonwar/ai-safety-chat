@@ -108,6 +108,118 @@ function hidePIIWarning() {
     piiWarningBar.classList.add('hidden');
 }
 
+/** Apply successful /chat JSON body: session, warnings, moderator log, AI bubble. */
+function handleChatSuccess(messageText, data) {
+    if (data.session_id) {
+        currentSessionId = data.session_id;
+        localStorage.setItem('aiSafetyChatSessionId', currentSessionId);
+    }
+
+    const isRisky = data.flagged;
+    const detectedCategory = data.category !== 'safe' ? data.category : null;
+
+    if (isRisky) {
+        showInputWarning(detectedCategory);
+        logSafetyEvent(messageText, detectedCategory, `Backend flagged: ${data.message_for_moderator}`);
+        setTimeout(() => hideInputWarning(), 5000);
+    } else {
+        hideInputWarning();
+        logSafetyEvent(messageText, null, 'No safety concerns detected by backend');
+    }
+
+    if (data.pii_warning) {
+        showPIIWarning(data.pii_warning);
+        logSafetyEvent(messageText, 'PII', 'Personal information detected and redacted');
+        setTimeout(() => hidePIIWarning(), 7000);
+    }
+
+    const confidenceScore =
+        data.confidence_score !== null && data.confidence_score !== undefined
+            ? parseFloat(data.confidence_score)
+            : null;
+    const confidenceLevel = data.confidence_level || null;
+    const confidenceReasons = data.confidence_reasons || [];
+
+    addMessage(
+        data.response,
+        'ai',
+        isRisky,
+        detectedCategory,
+        confidenceScore,
+        confidenceLevel,
+        confidenceReasons,
+        data.learning_analysis
+    );
+}
+
+/** NDJSON stream: delta lines then one `done` line with full ChatResponse fields. */
+async function readNdjsonChatStream(response, messageText) {
+    removeTypingIndicator();
+
+    const streamingDiv = document.createElement('div');
+    streamingDiv.className = 'message ai-message';
+    streamingDiv.id = 'streamingAiMessage';
+    const currentTime = new Date().toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+    });
+    streamingDiv.innerHTML = `
+        <div class="message-avatar">
+            <i class="fas fa-robot"></i>
+        </div>
+        <div class="message-content">
+            <div class="message-header">
+                <span class="message-sender">AI Assistant</span>
+                <span class="message-time">${currentTime}</span>
+            </div>
+            <div class="message-text" id="streamingAiText"></div>
+        </div>`;
+    chatMessages.appendChild(streamingDiv);
+    scrollToBottom();
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let donePayload = null;
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (!line) continue;
+            const ev = JSON.parse(line);
+            if (ev.type === 'delta') {
+                const el = document.getElementById('streamingAiText');
+                if (el) el.textContent += ev.text;
+                scrollToBottom();
+            } else if (ev.type === 'safety_violation') {
+                console.warn('Stream safety violation:', ev.category, ev.reason);
+            } else if (ev.type === 'done') {
+                donePayload = ev;
+            }
+        }
+    }
+    if (buffer.trim()) {
+        const ev = JSON.parse(buffer.trim());
+        if (ev.type === 'done') {
+            donePayload = ev;
+        }
+    }
+
+    const streaming = document.getElementById('streamingAiMessage');
+    if (streaming) streaming.remove();
+
+    if (!donePayload) {
+        throw new Error('Stream ended without a done event');
+    }
+    const { type: _t, ...rest } = donePayload;
+    handleChatSuccess(messageText, rest);
+}
+
 // Send Message
 async function sendMessage() {
     const messageText = messageInput.value.trim();
@@ -130,88 +242,31 @@ async function sendMessage() {
             message: messageText,
             learning_mode: userSettings.learning_mode || learningMode,
             settings: userSettings,
-            session_id: currentSessionId  // Send existing session_id to continue conversation
+            session_id: currentSessionId,
+            stream: true,
         };
-        
-        // Send request with user settings
-        
-        // Call backend API
+
         const response = await fetch(`${API_BASE_URL}/chat`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
         });
-        
+
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
-        
-        const data = await response.json();
-        
-        // Store session_id from response to maintain conversation continuity
-        if (data.session_id) {
-            currentSessionId = data.session_id;
-            localStorage.setItem('aiSafetyChatSessionId', currentSessionId);
-        }
-        
-        // Remove typing indicator
-        removeTypingIndicator();
-        
-        // Handle safety metadata from backend
-        const isRisky = data.flagged;
-        const detectedCategory = data.category !== 'safe' ? data.category : null;
-        
-        // Show warning if risky content detected
-        if (isRisky) {
-            showInputWarning(detectedCategory);
-            logSafetyEvent(messageText, detectedCategory, `Backend flagged: ${data.message_for_moderator}`);
-            
-            // Auto-hide warning after 5 seconds
-            setTimeout(() => {
-                hideInputWarning();
-            }, 5000);
+
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('ndjson')) {
+            await readNdjsonChatStream(response, messageText);
         } else {
-            hideInputWarning();
-            logSafetyEvent(messageText, null, 'No safety concerns detected by backend');
+            const data = await response.json();
+            removeTypingIndicator();
+            handleChatSuccess(messageText, data);
         }
-        
-        // Show PII warning if personal information was detected
-        if (data.pii_warning) {
-            showPIIWarning(data.pii_warning);
-            logSafetyEvent(messageText, 'PII', 'Personal information detected and redacted');
-            
-            // Auto-hide PII warning after 7 seconds
-            setTimeout(() => {
-                hidePIIWarning();
-            }, 7000);
-        }
-        
-        // Guardrail explanation is displayed in UI if transparency is enabled
-        
-        // Add AI response with metadata and confidence
-        // Ensure we use the actual backend confidence data
-        const confidenceScore = data.confidence_score !== null && data.confidence_score !== undefined 
-            ? parseFloat(data.confidence_score) 
-            : null;
-        const confidenceLevel = data.confidence_level || null;
-        const confidenceReasons = data.confidence_reasons || [];
-        
-        // Confidence data extracted from response
-        
-        // Learning analysis data extracted from response
-        addMessage(
-            data.response, 
-            'ai', 
-            isRisky, 
-            detectedCategory,
-            confidenceScore,
-            confidenceLevel,
-            confidenceReasons,
-            data.learning_analysis  // Pass learning analysis
-        );
-        
+
     } catch (error) {
         // Fallback to mock response if backend is unavailable
         console.error('Backend error, using fallback:', error);

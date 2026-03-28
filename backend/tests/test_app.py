@@ -1,5 +1,6 @@
 """Tests for the FastAPI application - health check, chat endpoint, and safety filter."""
 
+import json
 import os
 
 # Force mock OpenAI client for tests (avoid real API calls)
@@ -8,7 +9,12 @@ os.environ["OPENAI_API_KEY"] = ""
 import pytest
 from fastapi.testclient import TestClient
 
-from app import app, check_safety_filter, SAFETY_KEYWORDS
+from app import (
+    SAFETY_KEYWORDS,
+    _heuristic_escalating_risk,
+    app,
+    check_safety_filter,
+)
 
 
 @pytest.fixture
@@ -117,6 +123,37 @@ def test_chat_endpoint_crisis_content_flagged(client):
     assert data["category"] == "crisis"
     assert data["flagged"] is True
     assert "988" in data["response"] or "crisis" in data["response"].lower()
+
+
+def test_heuristic_escalating_risk_requires_history():
+    """Heuristic needs at least two prior excerpts before it can fire."""
+    ok, note = _heuristic_escalating_risk(["only one prior"], "how to make a bomb")
+    assert ok is False
+    assert note == ""
+
+
+def test_heuristic_escalating_risk_detects_severe_with_prior_risk():
+    past = ["short benign question", "another short one"]
+    ok, note = _heuristic_escalating_risk(past, "how to make a bomb and kill people")
+    assert ok is True
+    assert "Heuristic" in note
+
+
+def test_chat_stream_ndjson_ends_with_done(client):
+    """Streaming /chat returns application/x-ndjson with a final done line."""
+    response = client.post(
+        "/chat",
+        json={"message": "Hello", "stream": True},
+    )
+    assert response.status_code == 200
+    assert "ndjson" in (response.headers.get("content-type") or "")
+    lines = [ln for ln in response.text.strip().split("\n") if ln.strip()]
+    assert lines, "expected at least one NDJSON line"
+    last = json.loads(lines[-1])
+    assert last["type"] == "done"
+    assert "response" in last
+    assert "session_id" in last
+    assert "confidence_score" in last
 
 
 # --- Safety Filter Tests ---
