@@ -2986,3 +2986,74 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ============================================
+# Moderator Queue Endpoints
+# ============================================
+
+
+@app.get("/moderator/flags", response_model=List[FlaggedMessage])
+async def get_moderator_flags(
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    """
+    Fetch all flagged messages for the moderator queue.
+    """
+    # 1. Query user messages that are flagged or non-safe
+    flagged_messages = (
+        db.query(Message)
+        .filter(Message.role == "user")  # We flag the user's input
+        .filter(
+            or_(
+                Message.flagged == True,
+                and_(Message.category.isnot(None), Message.category != "safe"),
+            )
+        )
+        .order_by(Message.timestamp.desc())
+        .all()
+    )
+
+    results = []
+    for msg in flagged_messages:
+        # 2. Find the AI's response to this specific message
+        # We look for the next message in the same conversation with role='assistant'
+        ai_msg = (
+            db.query(Message)
+            .filter(Message.conversation_id == msg.conversation_id)
+            .filter(Message.role == "assistant")
+            .filter(Message.timestamp > msg.timestamp)
+            .order_by(Message.timestamp.asc())
+            .first()
+        )
+
+        conv = (
+            db.query(Conversation)
+            .filter(Conversation.id == msg.conversation_id)
+            .first()
+        )
+        user = db.query(User).filter(User.id == conv.user_id).first() if conv else None
+
+        results.append(
+            FlaggedMessage(
+                id=msg.id,
+                timestamp=msg.timestamp.isoformat()
+                if hasattr(msg.timestamp, "isoformat")
+                else str(msg.timestamp),
+                user_message=msg.content or "",
+                # Use the content of the assistant message we found
+                ai_response=ai_msg.content
+                if ai_msg
+                else "No response generated (blocked)",
+                category=msg.category,
+                confidence=msg.confidence or 0.0,
+                confidence_score=msg.confidence_score or 0.0,
+                confidence_level=msg.confidence_level or "Unknown",
+                user_id=user.id if user else None,
+                username=user.username if user else "Anonymous",
+                priority_level=msg.priority_level or "medium",
+                escalation_reason=msg.escalation_reason or "Flagged by safety filter",
+                target_response_time=msg.target_response_time or 15,
+            )
+        )
+
+    return results

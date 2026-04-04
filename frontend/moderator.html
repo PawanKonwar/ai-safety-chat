@@ -8,8 +8,9 @@
     <link rel="stylesheet" href="moderator.css">
 </head>
 <body>
+    <div id="notificationContainer" class="notification-container"></div>
+
     <div class="dashboard-container">
-        <!-- Header -->
         <header class="dashboard-header">
             <div class="header-left">
                 <h1><i class="fas fa-user-shield"></i> Moderator Dashboard</h1>
@@ -23,7 +24,6 @@
             </div>
         </header>
 
-        <!-- Stats Panel -->
         <div class="stats-panel">
             <div class="stat-card">
                 <div class="stat-icon" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
@@ -54,13 +54,11 @@
             </div>
         </div>
 
-        <!-- Main Content -->
         <div class="dashboard-content">
-            <!-- Pending Reviews Section -->
             <section class="review-section">
                 <div class="section-header">
                     <h2><i class="fas fa-exclamation-circle"></i> Pending Reviews</h2>
-                    <button id="simulateFlagBtn" class="btn-simulate">
+                    <button type="button" id="simulateFlagBtn" class="btn-simulate">
                         <i class="fas fa-plus"></i>
                         Simulate New Flag
                     </button>
@@ -77,17 +75,15 @@
                             </tr>
                         </thead>
                         <tbody id="pendingTableBody">
-                            <!-- Populated by JavaScript -->
-                        </tbody>
+                            </tbody>
                     </table>
-                    <div id="noPending" class="empty-state">
+                    <div id="noPending" class="empty-state hidden">
                         <i class="fas fa-check-circle"></i>
                         <p>No pending reviews. All clear!</p>
                     </div>
                 </div>
             </section>
 
-            <!-- Reviewed Section -->
             <section class="review-section">
                 <div class="section-header">
                     <h2><i class="fas fa-check-double"></i> Reviewed Items</h2>
@@ -104,8 +100,7 @@
                             </tr>
                         </thead>
                         <tbody id="reviewedTableBody">
-                            <!-- Populated by JavaScript -->
-                        </tbody>
+                            </tbody>
                     </table>
                     <div id="noReviewed" class="empty-state">
                         <i class="fas fa-inbox"></i>
@@ -116,12 +111,11 @@
         </div>
     </div>
 
-    <!-- Edit Modal -->
     <div id="editModal" class="modal hidden">
         <div class="modal-content">
             <div class="modal-header">
                 <h3><i class="fas fa-edit"></i> Edit & Approve Response</h3>
-                <button class="modal-close" id="closeEditModalBtn">
+                <button type="button" class="modal-close" id="closeEditModalBtn">
                     <i class="fas fa-times"></i>
                 </button>
             </div>
@@ -137,26 +131,21 @@
                         <span id="editCharCount">0</span> / 2000 characters
                     </div>
                 </div>
-                <div class="modal-section">
-                    <label for="editNotes">Notes (optional):</label>
-                    <textarea id="editNotes" rows="2" placeholder="Add any notes about this edit..."></textarea>
-                </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-cancel" id="cancelEditBtn">Cancel</button>
-                <button class="btn-save" id="saveEditBtn">
+                <button type="button" class="btn-cancel" id="cancelEditBtn">Cancel</button>
+                <button type="button" class="btn-save" id="saveEditBtn">
                     <i class="fas fa-check"></i> Save & Approve
                 </button>
             </div>
         </div>
     </div>
 
-    <!-- Reject Modal -->
     <div id="rejectModal" class="modal hidden">
         <div class="modal-content">
             <div class="modal-header">
                 <h3><i class="fas fa-times-circle"></i> Reject & Provide Alternative</h3>
-                <button class="modal-close" id="closeRejectModalBtn">
+                <button type="button" class="modal-close" id="closeRejectModalBtn">
                     <i class="fas fa-times"></i>
                 </button>
             </div>
@@ -183,15 +172,11 @@
                         <span id="rejectCharCount">0</span> / 2000 characters
                     </div>
                 </div>
-                <div class="modal-section">
-                    <label for="rejectNotes">Notes (optional):</label>
-                    <textarea id="rejectNotes" rows="2" placeholder="Add any notes about this rejection..."></textarea>
-                </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-cancel" id="cancelRejectBtn">Cancel</button>
-                <button class="btn-reject" id="saveRejectBtn">
-                    <i class="fas fa-check"></i> Reject & Send Alternative
+                <button type="button" class="btn-cancel" id="cancelRejectBtn">Cancel</button>
+                <button type="button" class="btn-reject" id="saveRejectBtn">
+                    <i class="fas fa-times"></i> Reject & Send Alternative
                 </button>
             </div>
         </div>

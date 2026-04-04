@@ -695,6 +695,11 @@ body {
     gap: 12px;
 }
 
+/* Clicks on Font Awesome icons bubble to the button; ensure the icon never steals the hit target */
+.modal-footer button i {
+    pointer-events: none;
+}
+
 .btn-cancel, .btn-save {
     padding: 10px 20px;
     border: none;
@@ -719,12 +724,20 @@ body {
     color: white;
 }
 
-.btn-reject {
+/* Primary reject CTA in modals only (table rows keep .btn-action.btn-reject above) */
+.modal-footer .btn-reject {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 12px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
     background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
     color: white;
 }
 
-.btn-reject:hover {
+.modal-footer .btn-reject:hover {
     background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(239, 68, 68, 0.4);
