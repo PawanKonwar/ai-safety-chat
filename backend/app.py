@@ -3005,7 +3005,7 @@ async def get_moderator_flags(
         .filter(Message.role == "user")  # We flag the user's input
         .filter(
             or_(
-                Message.flagged == True,
+                Message.flagged == False,
                 and_(Message.category.isnot(None), Message.category != "safe"),
             )
         )
